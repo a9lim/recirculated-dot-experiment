@@ -26,20 +26,19 @@ Structure the implementation exploits, all exact:
    slab is serial.
 2. First pass of column t and second pass of column t-1 share a cache
    snapshot (the paper runs them concurrently), so they run as ONE
-   batched [2B] call over the serial slab.
-3. Dual-pass visibility is per-lane prefix lengths, which the
-   FlashAttention kvcache kernel expresses natively via per-row
-   cache_seqlens — lane 0 appends the first-pass KV at slot t, lane 1
-   overwrites its own recompute at t-1, both in-kernel, GQA native, no
-   mask tensor anywhere. Lane 0's refresh commits as one fused
-   lane1->lane0 copy at step end (the next reader is step t+1, so
-   end-of-step commit preserves the same-snapshot semantics exactly).
+   interleaved [2B] call over the serial slab.
+3. The two branches share the refreshed prefix 0..t-2 exactly. It is
+   stored once, while one side slot retains lane 0's prior first-pass
+   KV. FA2 reads the common prefix through adjacent cache_batch_idx
+   rows; a compiled two-key tail and fp32 LSE merge add each branch's
+   distinct keys. The refresh write happens only after both queries,
+   preserving same-snapshot semantics while halving KV storage.
 4. The tensor work is split into fullgraph regions for prefill, the
-   first slab step, the recurrent mix+slab step, and readout. Cache
-   writes hide inside a custom op and commits live in the small Python
-   state machine, so the recurrent graph remains mutation-free from
-   inductor's perspective. flash-attn's raw PyCapsule entries are
-   wrapped as torch custom ops.
+   first slab step, the recurrent mix+slab step, and readout. A manual
+   steady-step CUDA graph puts device-side position selection, recurrent
+   state, cache writes, top-state storage, and counters behind one host
+   replay per position. flash-attn's raw PyCapsule entries are wrapped
+   as torch custom ops.
 5. Gemma's frozen Q/K/V and gate/up weights are packed once, reducing
    each decoder layer from seven GEMMs to four without changing the
    stored model weights. RoPE, cache metadata, and output scratch are
@@ -87,35 +86,6 @@ from transformers import AttentionInterface, AttentionMaskInterface
 from transformers.models.gemma3.modeling_gemma3 import apply_rotary_pos_emb
 
 
-# flash_attn 2.8 exposes fwd_kvcache as a raw C extension (PyCapsule),
-# which dynamo cannot trace; wrapping it as a torch custom op with the
-# cache mutations declared makes it an opaque-but-graphable extern.
-@torch.library.custom_op("wire::fa2_kvcache", mutates_args=("k_cache", "v_cache"))
-def _fa2_op(
-    q: Tensor,
-    k_cache: Tensor,
-    v_cache: Tensor,
-    k_new: Tensor,
-    v_new: Tensor,
-    cache_seqlens: Tensor,
-    scale: float,
-) -> Tensor:
-    return _fa2_kvcache(
-        q,
-        k_cache,
-        v_cache,
-        k=k_new,
-        v=v_new,
-        cache_seqlens=cache_seqlens,
-        softmax_scale=scale,
-    )
-
-
-@_fa2_op.register_fake
-def _(q, k_cache, v_cache, k_new, v_new, cache_seqlens, scale):
-    return torch.empty_like(q)
-
-
 @torch.library.custom_op("wire::fa2_prefill", mutates_args=())
 def _fa2_prefill_op(q: Tensor, k: Tensor, v: Tensor, scale: float) -> Tensor:
     """Traceable, maskless causal FA2 prefill for the <=window wire."""
@@ -127,42 +97,137 @@ def _(q, k, v, scale):
     return torch.empty_like(q)
 
 
+def _merge_branch_tails(
+    q: Tensor,
+    k_new: Tensor,
+    v_new: Tensor,
+    side_k: Tensor,
+    side_v: Tensor,
+    prefix: Tensor,
+    prefix_lse: Tensor,
+    cache_seqlens: Tensor,
+    scale: float,
+) -> Tensor:
+    """Small exact two-key softmax kept separate from the 21-layer graph."""
+    q0, q1 = q[0::2], q[1::2]
+    k0, k1 = k_new[0::2], k_new[1::2]
+    v0, v1 = v_new[0::2], v_new[1::2]
+    score_prev = (q0 * side_k).sum(dim=-1) * scale
+    score_new = (q0 * k0).sum(dim=-1) * scale
+    tail_scores0 = torch.stack([score_prev, score_new], dim=-1).float()
+    tail_weights0 = torch.softmax(tail_scores0, dim=-1)
+    tail_lse0 = torch.logsumexp(tail_scores0, dim=-1)
+    tail_out0 = (
+        tail_weights0[..., :1] * side_v.float() + tail_weights0[..., 1:] * v0.float()
+    )
+    tail_lse1 = ((q1 * k1).sum(dim=-1) * scale).float()
+    tail_out1 = v1.expand(-1, -1, q.shape[2], -1).float()
+    tail = torch.stack([tail_out0, tail_out1], dim=1).reshape_as(prefix)
+    tail_lse = torch.stack([tail_lse0, tail_lse1], dim=1).reshape(
+        q.shape[0], q.shape[1], q.shape[2]
+    )
+    prefix_lse = torch.where(
+        cache_seqlens[:1] > 0,
+        prefix_lse.transpose(1, 2),
+        torch.full_like(prefix_lse.transpose(1, 2), float("-inf")),
+    )
+    maximum = torch.maximum(prefix_lse, tail_lse)
+    prefix_weight = torch.exp(prefix_lse - maximum)
+    tail_weight = torch.exp(tail_lse - maximum)
+    return (
+        (
+            prefix_weight.unsqueeze(-1) * prefix.float()
+            + tail_weight.unsqueeze(-1) * tail
+        )
+        / (prefix_weight + tail_weight).unsqueeze(-1)
+    ).to(q.dtype)
+
+
+_merge_branch_tails_c = torch.compile(
+    _merge_branch_tails, fullgraph=True, dynamic=False
+)
+
+
+@torch.library.custom_op(
+    "wire::dual_branch_attention",
+    mutates_args=("k_cache", "v_cache", "side_k", "side_v"),
+)
+def _dual_branch_attention_op(
+    q: Tensor,
+    k_cache: Tensor,
+    v_cache: Tensor,
+    side_k: Tensor,
+    side_v: Tensor,
+    k_new: Tensor,
+    v_new: Tensor,
+    cache_seqlens: Tensor,
+    cache_batch_idx: Tensor,
+    write_index: Tensor,
+    scale: float,
+) -> Tensor:
+    prefix, prefix_lse = _fa2_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        cache_batch_idx=cache_batch_idx,
+        softmax_scale=scale,
+        return_softmax_lse=True,
+    )
+    out = _merge_branch_tails_c(
+        q,
+        k_new,
+        v_new,
+        side_k,
+        side_v,
+        prefix,
+        prefix_lse,
+        cache_seqlens,
+        scale,
+    )
+    k0, k1 = k_new[0::2], k_new[1::2]
+    v0, v1 = v_new[0::2], v_new[1::2]
+    k_cache.index_copy_(1, write_index, k1)
+    v_cache.index_copy_(1, write_index, v1)
+    side_k.copy_(k0)
+    side_v.copy_(v0)
+    return out
+
+
+@_dual_branch_attention_op.register_fake
+def _(
+    q,
+    k_cache,
+    v_cache,
+    side_k,
+    side_v,
+    k_new,
+    v_new,
+    cache_seqlens,
+    cache_batch_idx,
+    write_index,
+    scale,
+):
+    return torch.empty_like(q)
+
+
 from transformers.integrations.flash_attention import flash_attention_forward
 from transformers.masking_utils import flash_attention_mask
 
 
 def _wire_attention(module, query, key, value, attention_mask, **kwargs):
-    """FA2 everywhere (D10 addendum). Dual-pass steps (wire_cache set)
-    go through the kvcache custom op; everything else — pass A's
-    maskless causal prefill, plain HF forwards on the flipped model —
-    defers to HF's flash_attention_2 interface, which handles causal,
-    sliding-window, and padding/unpadding. The paired mask-interface
-    registration makes create_causal_mask build FA2-format inputs
-    (None when fully causal, 2D for padding) instead of dense 4D."""
-    cache = kwargs.get("wire_cache")
-    if cache is None:
-        # HF's delegate resolves the flash package by reading
-        # module.config._attn_implementation; scope the name to the
-        # stock one for exactly this call (outside it, the config must
-        # keep saying wire_attention so mask building stays FA2-format
-        # and dispatch keeps hitting this function).
-        mc = module.config
-        mc._attn_implementation = "flash_attention_2"
-        try:
-            return flash_attention_forward(
-                module, query, key, value, attention_mask, **kwargs
-            )
-        finally:
-            mc._attn_implementation = "wire_attention"
-    out = _fa2_op(
-        query.transpose(1, 2),
-        *cache.views(module.layer_idx),
-        key.transpose(1, 2),
-        value.transpose(1, 2),
-        cache.seqlens,
-        kwargs.get("scaling"),
-    )
-    return out, None
+    """Delegate ordinary model forwards to HF's FA2 interface."""
+    # HF resolves the flash package by reading this name; scope it to the
+    # stock implementation for exactly this call while keeping the custom
+    # mask interface and dispatcher name outside it.
+    mc = module.config
+    mc._attn_implementation = "flash_attention_2"
+    try:
+        return flash_attention_forward(
+            module, query, key, value, attention_mask, **kwargs
+        )
+    finally:
+        mc._attn_implementation = "wire_attention"
 
 
 AttentionInterface.register("wire_attention", _wire_attention)
@@ -183,13 +248,14 @@ class WireConfig:
         return min(t / self.ramp_steps, 1.0) * self.alpha
 
 
-class DualCache:
-    """Stacked FA2-layout ([rows, seq, kv_heads, head_dim]) KV lanes for
-    the serial slab. The kvcache kernel does the slot writes in-kernel
-    from cache_seqlens (lane 0 appends first-pass at slot t; lane 1
-    overwrites its recompute at t-1), so `update` — the transformers
-    Cache calling convention — just forwards the new-token KV through to
-    the attention interface."""
+class BranchCache:
+    """Shared refreshed prefix plus one first-pass branch KV per layer.
+
+    At steady step ``t`` both branch queries see the same refreshed slots
+    ``0..t-2``.  Lane 0 adds the prior first-pass KV and its own new KV;
+    lane 1 adds only its own recomputed KV.  Storing that decomposition
+    once halves the serial slab cache and lets FA2 reuse the common prefix.
+    """
 
     def __init__(
         self,
@@ -205,46 +271,52 @@ class DualCache:
     ):
         self.B = batch
         self.first = first_layer
-        shape = (n_slab, 2 * batch, max_len, kv_heads, head_dim)
+        shape = (n_slab, batch, max_len, kv_heads, head_dim)
         # Every visible slot is written before it is read. Empty allocation
         # avoids zeroing several GiB when a new shape bucket is created.
         self.k = torch.empty(shape, dtype=dtype, device=device)
         self.v = torch.empty(shape, dtype=dtype, device=device)
-        self.seq_base = torch.cat(
-            [
-                torch.zeros(batch, dtype=torch.int32, device=device),
-                torch.full((batch,), -1, dtype=torch.int32, device=device),
-            ]
+        side_shape = (n_slab, batch, 1, kv_heads, head_dim)
+        self.side_k = torch.empty(side_shape, dtype=dtype, device=device)
+        self.side_v = torch.empty(side_shape, dtype=dtype, device=device)
+        self.seq_table = (
+            torch.arange(max_len, dtype=torch.int32, device=device)
+            .unsqueeze(1)
+            .expand(-1, 2 * batch)
+            .contiguous()
         )
-        self.seq_table = self.seq_base.unsqueeze(0) + torch.arange(
-            max_len, dtype=torch.int32, device=device
-        ).unsqueeze(1)
-        self.seqlens = self.seq_table[0, :batch]
+        self.index_table = torch.arange(max_len, dtype=torch.int64, device=device)
+        self.cache_batch_idx = torch.arange(
+            batch, dtype=torch.int32, device=device
+        ).repeat_interleave(2)
+        self.seqlens = self.seq_table[0]
+        self.write_index = self.index_table[:1]
         self.rows = batch
         self.tops = torch.empty(batch, max_len, hidden_size, dtype=dtype, device=device)
         self.rope_dual: dict[str, tuple[Tensor, Tensor]] = {}
         self.alpha: Tensor | None = None
         self.beta: Tensor | None = None
+        # Fixed-address storage used by the manually captured recurrent
+        # CUDA graph.  The graph indexes these buffers with device-resident
+        # counters, so one capture covers every steady position.
+        self.h_dest = torch.empty(
+            batch, max_len, hidden_size, dtype=dtype, device=device
+        )
+        self.h_s_state = torch.empty(batch, 1, hidden_size, dtype=dtype, device=device)
+        self.graph_t = torch.ones(1, dtype=torch.int64, device=device)
+        self.graph_prev = torch.zeros(1, dtype=torch.int64, device=device)
+        self.graph_seqlens = self.seq_table[0].clone() if max_len > 1 else None
 
     def bind_rope(self, rope: dict[str, tuple[Tensor, Tensor]]) -> None:
         """Materialize stable dual-lane RoPE buffers once per shape bucket."""
         max_len = self.k.shape[2]
+
+        def interleave(x: Tensor) -> Tensor:
+            pair = torch.stack([x[:, 1:max_len], x[:, : max_len - 1]], dim=1)
+            return pair.expand(self.B, -1, -1, -1).reshape(2 * self.B, max_len - 1, -1)
+
         self.rope_dual = {
-            lt: (
-                torch.cat(
-                    [
-                        c[:, 1:max_len].expand(self.B, -1, -1),
-                        c[:, : max_len - 1].expand(self.B, -1, -1),
-                    ]
-                ),
-                torch.cat(
-                    [
-                        s[:, 1:max_len].expand(self.B, -1, -1),
-                        s[:, : max_len - 1].expand(self.B, -1, -1),
-                    ]
-                ),
-            )
-            for lt, (c, s) in rope.items()
+            lt: (interleave(c), interleave(s)) for lt, (c, s) in rope.items()
         }
 
     def bind_alpha(self, cfg: WireConfig) -> None:
@@ -255,26 +327,10 @@ class DualCache:
     def step(self, t: int) -> None:
         if t == 0:
             self.rows = self.B
-            self.seqlens = self.seq_table[0, : self.B]
         else:
             self.rows = 2 * self.B
-            self.seqlens = self.seq_table[t]
-
-    def views(self, layer_idx: int) -> tuple[Tensor, Tensor]:
-        j = layer_idx - self.first
-        return self.k[j, : self.rows], self.v[j, : self.rows]
-
-    def update(
-        self, key_states: Tensor, value_states: Tensor, layer_idx: int, *a, **kw
-    ):
-        return key_states, value_states  # the kvcache kernel does the write
-
-    def commit(self, t: int) -> None:
-        """Refresh lane 0's slot t-1 across all layers in one fused copy —
-        called at step end, after every layer's first-pass attention has
-        consumed its view (same-snapshot semantics)."""
-        self.k[:, : self.B, t - 1] = self.k[:, self.B :, t - 1]
-        self.v[:, : self.B, t - 1] = self.v[:, self.B :, t - 1]
+            self.seqlens = self.seq_table[t - 1]
+            self.write_index = self.index_table[t - 1 : t]
 
 
 class RecirculationEngine:
@@ -306,8 +362,9 @@ class RecirculationEngine:
         self.hidden_size = mc.hidden_size
         self.window = mc.sliding_window
         self.softcap = getattr(mc, "final_logit_softcapping", None)  # None on Gemma3-1B
-        self._cache: DualCache | None = None
+        self._cache: BranchCache | None = None
         self._rope: dict[str, tuple[Tensor, Tensor]] | None = None
+        self._steady_graph: torch.cuda.CUDAGraph | None = None
         self._build_packed_weights()
 
         # Compile every tensor-heavy region. The outer position loop remains
@@ -367,7 +424,27 @@ class RecirculationEngine:
         ).clamp_min(self.cfg.eps)
         return beta * h_d + alpha * ratio * h_s
 
-    def _layer(self, i: int, x: Tensor, pe, cache: DualCache | None) -> Tensor:
+    def _dual_attention(
+        self, i: int, q: Tensor, k_new: Tensor, v_new: Tensor, scale: float
+    ) -> Tensor:
+        """Exact two-branch attention with one physical refreshed prefix."""
+        cache = self._cache
+        j = i - cache.first
+        return _dual_branch_attention_op(
+            q,
+            cache.k[j],
+            cache.v[j],
+            cache.side_k[j],
+            cache.side_v[j],
+            k_new,
+            v_new,
+            cache.seqlens,
+            cache.cache_batch_idx,
+            cache.write_index,
+            scale,
+        )
+
+    def _layer(self, i: int, x: Tensor, pe, cache: BranchCache | None) -> Tensor:
         """Gemma3 decoder layer with packed QKV and gate/up projections."""
         layer = self.layers[i]
         attn = layer.self_attn
@@ -390,13 +467,20 @@ class RecirculationEngine:
             a = _fa2_prefill_op(
                 q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn.scaling
             )
+        elif cache.rows == cache.B:
+            q_new = q.transpose(1, 2)
+            k_new = k.transpose(1, 2)
+            v_new = v.transpose(1, 2)
+            a = _fa2_prefill_op(q_new, k_new, v_new, attn.scaling)
+            j = i - cache.first
+            cache.side_k[j].copy_(k_new)
+            cache.side_v[j].copy_(v_new)
         else:
-            a = _fa2_op(
+            a = self._dual_attention(
+                i,
                 q.transpose(1, 2),
-                *cache.views(i),
                 k.transpose(1, 2),
                 v.transpose(1, 2),
-                cache.seqlens,
                 attn.scaling,
             )
         a = a.reshape(*input_shape, -1).contiguous()
@@ -422,7 +506,7 @@ class RecirculationEngine:
     def _slab(self, x: Tensor, cos_f, sin_f, cos_s, sin_s):
         """One compiled step over layers dest+1..top."""
         cache = self._cache
-        h_s = x[: cache.B]
+        h_s = x[: cache.B] if cache.rows == cache.B else x[0::2]
         for i in range(self.cfg.dest + 1, self.n_layers):
             pe = (
                 (cos_f, sin_f)
@@ -431,11 +515,13 @@ class RecirculationEngine:
             )
             x = self._layer(i, x, pe, cache)
             if i == self.cfg.source:
-                h_s = x[: cache.B]
+                h_s = x[: cache.B] if cache.rows == cache.B else x[0::2]
         return x, h_s
 
     def _step(self, h_t: Tensor, h_prev: Tensor, h_s_prev: Tensor, alpha, beta, *rope):
-        x = torch.cat([h_t, self.mix(h_s_prev, h_prev, alpha, beta)])
+        x = torch.stack([h_t, self.mix(h_s_prev, h_prev, alpha, beta)], dim=1).flatten(
+            0, 1
+        )
         return self._slab(x, *rope)
 
     def _logits_chunk(self, h: Tensor) -> Tensor:
@@ -452,7 +538,72 @@ class RecirculationEngine:
     def _nll_chunk(self, h: Tensor, targets: Tensor) -> Tensor:
         return self._nll_from_logits(self._logits_chunk(h), targets)
 
-    def _ensure_cache(self, B: int, T: int, dtype, device) -> DualCache:
+    def _capture_steady_graph(self, cache: BranchCache) -> None:
+        """Capture one position-independent recurrent step.
+
+        All position selection, recurrent-state threading, top-state storage,
+        cache writes, and counter advancement live in the CUDA graph.  Its
+        only host work per position is ``graph.replay()``.
+        """
+        if cache.graph_seqlens is None:
+            return
+        cache.rows = 2 * cache.B
+        cache.seqlens = cache.graph_seqlens
+        cache.write_index = cache.graph_prev
+        # The captured path gathers contiguous one-position inputs whereas
+        # the eager controller passes strided views.  Compile that exact
+        # signature before stream capture: Dynamo consults the CUDA RNG
+        # state while compiling, which CUDA correctly forbids mid-capture.
+        t = cache.graph_t
+        prev = cache.graph_prev
+        cf, sf = cache.rope_dual["full_attention"]
+        cs, ss = cache.rope_dual["sliding_attention"]
+        cache.h_s_state.zero_()
+        self._step_c(
+            cache.h_dest.index_select(1, t),
+            cache.h_dest.index_select(1, prev),
+            cache.h_s_state,
+            cache.alpha.index_select(0, prev),
+            cache.beta.index_select(0, prev),
+            cf.index_select(1, prev),
+            sf.index_select(1, prev),
+            cs.index_select(1, prev),
+            ss.index_select(1, prev),
+        )
+        graph = torch.cuda.CUDAGraph()
+        capture_stream = torch.cuda.Stream(device=cache.k.device)
+        current = torch.cuda.current_stream(cache.k.device)
+        capture_stream.wait_stream(current)
+        with (
+            torch.cuda.stream(capture_stream),
+            torch.cuda.graph(graph, stream=capture_stream),
+        ):
+            t = cache.graph_t
+            prev = cache.graph_prev
+            h_t = cache.h_dest.index_select(1, t)
+            h_prev = cache.h_dest.index_select(1, prev)
+            cf, sf = cache.rope_dual["full_attention"]
+            cs, ss = cache.rope_dual["sliding_attention"]
+            x, h_s = self._step_c(
+                h_t,
+                h_prev,
+                cache.h_s_state,
+                cache.alpha.index_select(0, prev),
+                cache.beta.index_select(0, prev),
+                cf.index_select(1, prev),
+                sf.index_select(1, prev),
+                cs.index_select(1, prev),
+                ss.index_select(1, prev),
+            )
+            cache.tops.index_copy_(1, t, x[0::2])
+            cache.h_s_state.copy_(h_s)
+            cache.graph_seqlens.add_(1)
+            cache.graph_t.add_(1)
+            cache.graph_prev.add_(1)
+        current.wait_stream(capture_stream)
+        self._steady_graph = graph
+
+    def _ensure_cache(self, B: int, T: int, dtype, device) -> BranchCache:
         c = self._cache
         if (
             c is None
@@ -465,7 +616,7 @@ class RecirculationEngine:
             # length of at least four even when the visible sequence is
             # shorter. cache_seqlens still enforces the exact T=1..3 view.
             capacity = max(T, 4)
-            self._cache = DualCache(
+            self._cache = BranchCache(
                 self.n_layers - self.cfg.dest - 1,
                 self.cfg.dest + 1,
                 B,
@@ -478,6 +629,7 @@ class RecirculationEngine:
             )
             self._cache.bind_rope(self._ensure_rope(dtype, torch.device(device)))
             self._cache.bind_alpha(self.cfg)
+            self._steady_graph = None
         return self._cache
 
     @torch.inference_mode()
@@ -509,22 +661,39 @@ class RecirculationEngine:
         # Pass A: layers 0..dest for all columns in parallel (exact: the
         # refresh never touches these layers, so nothing here ever sees
         # recirculated state). No cache — slab KVs are never read later.
-        h_dest = self._prefill_c(input_ids, cf[:, :T], sf[:, :T], cs[:, :T], ss[:, :T])
+        h_dest_out = self._prefill_c(
+            input_ids, cf[:, :T], sf[:, :T], cs[:, :T], ss[:, :T]
+        )
 
         # Serial slab: layers dest+1..top, batched dual pass. Slicing
         # rope_dual at [t-1 : t] yields (position t for the first half,
         # position t-1 for the second).
         cache = self._ensure_cache(B, T, dtype, device)
+        cache.h_dest[:, :T].copy_(h_dest_out)
+        h_dest = cache.h_dest[:, :T]
         tops = cache.tops[:, :T]
         rope_dual = cache.rope_dual
         h_s_prev: Tensor | None = None
-        for t in range(T):
-            cache.step(t)
-            if t == 0:
-                x, h_s = self._slab_first_c(
-                    h_dest[:, :1], cf[:, :1], sf[:, :1], cs[:, :1], ss[:, :1]
-                )
-            else:
+        cache.step(0)
+        x, h_s = self._slab_first_c(
+            h_dest[:, :1], cf[:, :1], sf[:, :1], cs[:, :1], ss[:, :1]
+        )
+        tops[:, :1] = x[:B]
+        h_s_prev = h_s
+
+        if T > 1 and alpha_fn is None and self._steady_graph is not None:
+            cache.h_s_state.copy_(h_s_prev)
+            cache.graph_t.fill_(1)
+            cache.graph_prev.zero_()
+            cache.graph_seqlens.copy_(cache.seq_table[0])
+            cache.rows = 2 * B
+            cache.seqlens = cache.graph_seqlens
+            cache.write_index = cache.graph_prev
+            for _ in range(1, T):
+                self._steady_graph.replay()
+        else:
+            for t in range(1, T):
+                cache.step(t)
                 if alpha_fn is None:
                     ab = (cache.alpha[t - 1], cache.beta[t - 1])
                 else:
@@ -547,9 +716,14 @@ class RecirculationEngine:
                     cs[:, t - 1 : t],
                     ss[:, t - 1 : t],
                 )
-                cache.commit(t)
-            tops[:, t : t + 1] = x[:B]
-            h_s_prev = h_s
+                tops[:, t : t + 1] = x[0::2]
+                h_s_prev = h_s
+
+            # Build only after the compiled step has run outside capture.
+            # This first call remains the ordinary path; later calls reuse
+            # the fixed-address graph for all steady positions.
+            if T > 1 and alpha_fn is None and self._steady_graph is None:
+                self._capture_steady_graph(cache)
 
         # Deferred readout: chunked over positions to bound the fp32
         # softmax footprint at Gemma3's 262k vocab. The NLL-only compiled

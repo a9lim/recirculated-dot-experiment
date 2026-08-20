@@ -193,3 +193,56 @@ Gates: bf16 identity PASS (mean |dlogit| 5.81e-2, top-1 0.9902,
 plain/engine ppl 27.0229/27.0260); full 100x512 reproduction at the new
 default batch gives PG19 **-9.00%** and C4 **-5.11%**. `max-autotune`,
 FA2 `num_splits`, and larger readout chunks remained measured nulls.
+
+## Higher-effort CUDA kernel pass (2026-08-20)
+
+Each candidate was first microbenchmarked at Gemma3-1B's live recurrent
+shape and then admitted only by paired B=128, T=512 whole-wire timing on
+the RTX 4090. Quantization and multi-device parallelism were excluded.
+
+**Manual steady-step CUDA graph — landed.** A single capture uses
+device-resident current/previous indices and stable hidden, RoPE,
+sequence-length, recurrent-state, KV, and top-state buffers. Position
+selection, state threading, shared-cache writes, and counter increments
+all happen inside the graph; the host loop issues one replay per steady
+position. The first call remains the ordinary compiled path and creates
+the capture after all exact signatures are warm. Warm latency fell from
+2.836–2.838 s to 2.776–2.784 s (about 2%); arbitrary `alpha_fn` calls
+correctly retain the eager controller.
+
+**Exact shared-prefix dual-branch attention — landed.** At step `t`, the
+branches share refreshed KV `0..t-2` and differ only in their tail: the
+first pass adds `{first-pass(t-1), first-pass(t)}`, while the refresh adds
+`{refresh(t-1)}`. The new cache stores the prefix once plus one side KV.
+FA2 reads it through interleaved duplicate `cache_batch_idx` entries; a
+separately compiled two-key softmax and fp32 LSE merge reconstruct the
+two exact attentions before the refresh write. Across all 511 steady
+positions, one layer's attention sweep fell from 35.04 to 25.94 ms
+(1.35x). Whole-wire warm latency with the CUDA graph is **2.355–2.361 s,
+27.8k token/s**, a **1.20x throughput gain** over the 2.84 s prior path.
+Warm peak allocation falls from 9.36 to **8.20 GiB** because the slab KV
+history is no longer duplicated.
+
+The other requested routes failed the whole-path gate:
+
+- **FA2-fused RoPE:** the isolated recurrent attention improved 3.23x at
+  position 1, 2.02x at 255, and 1.17x at 511, and saved about 0.25 GiB;
+  nevertheless the full wire regressed to 2.852 s (about 0.5%). Removed.
+- **RMSNorm-linear/residual fusion:** commuting the frozen RMS scale into
+  QKV and gate/up weights made their representative kernels 2–3% slower
+  and introduced larger bf16 rounding drift. NVIDIA Transformer Engine
+  had no wheel for the pinned torch 2.8/cu128/Python 3.12 stack and its
+  source extension failed on an unavailable CUDA header; every temporary
+  package was removed and `uv pip check` returned clean. The residual
+  norm chains are already fused by Inductor. Removed.
+- **Readout overlap:** issuing each completed NLL chunk on a second CUDA
+  stream produced 2.775–2.783 s, indistinguishable from graph-only, with
+  bitwise-identical NLL. The LM-head GEMM contends with rather than hides
+  behind the recurrent slab. Removed.
+
+Final gates on the shared-prefix algorithm: bf16 identity PASS (mean
+|dlogit| 5.82e-2, top-1 0.9824, plain/engine ppl 27.0229/27.0587), exact
+repeatability under graph replay, T=1..4 in bf16 and fp16, and arbitrary
+alpha fallback all finite. The 100x512 reproduction remains PG19
+**-9.00%** and C4 **-5.09%**. The small identity shift is inside the
+pre-calibrated bf16 kernel-order null and below every G0 threshold.

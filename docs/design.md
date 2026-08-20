@@ -183,6 +183,28 @@ unrolled 512-step mutable loop is brittle and enormous; regional
 fullgraph compilation gets the fusion without obscuring the wire's
 snapshot/commit boundary.
 
+*Higher-effort CUDA addendum (same day, a9 ratified).* The preceding
+controller/cache boundary is superseded after direct 4090 measurement.
+The steady step is now one position-independent manual CUDA graph with
+device-resident counters: selection, recurrent-state threading, cache
+writes, and top-state storage are captured without unrolling 512 copies.
+The first call runs the regional compiled controller and builds the
+capture; later calls replay it. A user-supplied adaptive `alpha_fn`
+retains the compiled eager controller until that gate itself has a
+static capture contract.
+
+Store the two attention branches by their mathematical decomposition,
+not as duplicated histories. Both queries read one physical refreshed
+prefix `0..t-2`; a one-slot side buffer holds the prior first-pass KV.
+Adjacent `cache_batch_idx` rows let FA2 reuse that prefix, and a compiled
+two-key tail plus fp32 log-sum-exp merge adds each branch's distinct
+keys. Only after the two queries complete does the refresh enter the
+shared prefix. This is the same snapshot boundary, removes the explicit
+commit, and halves slab KV storage. Fused RoPE, norm-linear algebra,
+concurrent readout, quantization, and device parallelism are not part of
+the canonical path: the first three failed the end-to-end speed gate;
+the latter two were explicitly out of scope.
+
 ## Open
 
 - Reachability negatives are unconstrained; if shortcut heuristics
