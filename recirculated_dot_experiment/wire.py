@@ -69,10 +69,13 @@ from dataclasses import dataclass
 
 import torch
 from torch import Tensor
+from torch.nn import functional as F
+from transformers.models.gemma3.modeling_gemma3 import apply_rotary_pos_emb
 from transformers import AttentionInterface, AttentionMaskInterface
 
 # Hard requirement (D10): no degraded mode — the module refuses to import
 # without flash-attn, by design.
+from flash_attn import flash_attn_func as _fa2_prefill
 from flash_attn import flash_attn_with_kvcache as _fa2_kvcache
 
 # flash_attn 2.8 exposes fwd_kvcache as a raw C extension (PyCapsule),
@@ -94,6 +97,17 @@ def _fa2_op(
 
 @_fa2_op.register_fake
 def _(q, k_cache, v_cache, k_new, v_new, cache_seqlens, scale):
+    return torch.empty_like(q)
+
+
+@torch.library.custom_op("wire::fa2_prefill", mutates_args=())
+def _fa2_prefill_op(q: Tensor, k: Tensor, v: Tensor, scale: float) -> Tensor:
+    """Traceable, maskless causal FA2 prefill for the <=window wire."""
+    return _fa2_prefill(q, k, v, dropout_p=0.0, softmax_scale=scale, causal=True)
+
+
+@_fa2_prefill_op.register_fake
+def _(q, k, v, scale):
     return torch.empty_like(q)
 
 from transformers.integrations.flash_attention import flash_attention_forward
@@ -164,30 +178,59 @@ class DualCache:
         kv_heads: int,
         max_len: int,
         head_dim: int,
+        hidden_size: int,
         dtype: torch.dtype,
         device: torch.device | str,
     ):
         self.B = batch
         self.first = first_layer
         shape = (n_slab, 2 * batch, max_len, kv_heads, head_dim)
-        self.k = torch.zeros(shape, dtype=dtype, device=device)
-        self.v = torch.zeros(shape, dtype=dtype, device=device)
+        # Every visible slot is written before it is read. Empty allocation
+        # avoids zeroing several GiB when a new shape bucket is created.
+        self.k = torch.empty(shape, dtype=dtype, device=device)
+        self.v = torch.empty(shape, dtype=dtype, device=device)
         self.seq_base = torch.cat(
             [
                 torch.zeros(batch, dtype=torch.int32, device=device),
                 torch.full((batch,), -1, dtype=torch.int32, device=device),
             ]
         )
-        self.seqlens = self.seq_base[:batch].clone()
+        self.seq_table = self.seq_base.unsqueeze(0) + torch.arange(
+            max_len, dtype=torch.int32, device=device
+        ).unsqueeze(1)
+        self.seqlens = self.seq_table[0, :batch]
         self.rows = batch
+        self.tops = torch.empty(batch, max_len, hidden_size, dtype=dtype, device=device)
+        self.rope_dual: dict[str, tuple[Tensor, Tensor]] = {}
+
+    def bind_rope(self, rope: dict[str, tuple[Tensor, Tensor]]) -> None:
+        """Materialize stable dual-lane RoPE buffers once per shape bucket."""
+        max_len = self.k.shape[2]
+        self.rope_dual = {
+            lt: (
+                torch.cat(
+                    [
+                        c[:, 1:max_len].expand(self.B, -1, -1),
+                        c[:, : max_len - 1].expand(self.B, -1, -1),
+                    ]
+                ),
+                torch.cat(
+                    [
+                        s[:, 1:max_len].expand(self.B, -1, -1),
+                        s[:, : max_len - 1].expand(self.B, -1, -1),
+                    ]
+                ),
+            )
+            for lt, (c, s) in rope.items()
+        }
 
     def step(self, t: int) -> None:
         if t == 0:
             self.rows = self.B
-            self.seqlens = torch.zeros(self.B, dtype=torch.int32, device=self.k.device)
+            self.seqlens = self.seq_table[0, : self.B]
         else:
             self.rows = 2 * self.B
-            self.seqlens = self.seq_base + t
+            self.seqlens = self.seq_table[t]
 
     def views(self, layer_idx: int) -> tuple[Tensor, Tensor]:
         j = layer_idx - self.first
@@ -228,17 +271,111 @@ class RecirculationEngine:
         self.layer_types = mc.layer_types
         self.n_layers = mc.num_hidden_layers
         self.kv_heads = mc.num_key_value_heads
+        self.q_heads = mc.num_attention_heads
         self.head_dim = mc.head_dim
+        self.hidden_size = mc.hidden_size
         self.window = mc.sliding_window
         self.softcap = getattr(mc, "final_logit_softcapping", None)  # None on Gemma3-1B
         self._cache: DualCache | None = None
-        self._slab_c = torch.compile(self._slab, fullgraph=True, dynamic=False)
+        self._rope: dict[str, tuple[Tensor, Tensor]] | None = None
+        self._build_packed_weights()
+
+        # Compile every tensor-heavy region. The outer position loop remains
+        # the small state machine that advances views into the mutable cache.
+        compile_kw = {"fullgraph": True, "dynamic": False}
+        self._prefill_c = torch.compile(self._prefill, **compile_kw)
+        self._slab_first_c = torch.compile(self._slab, **compile_kw)
+        self._step_c = torch.compile(self._step, **compile_kw)
+        self._nll_chunk_c = torch.compile(self._nll_chunk, **compile_kw)
+        self._logits_chunk_c = torch.compile(self._logits_chunk, **compile_kw)
+        self._nll_from_logits_c = torch.compile(self._nll_from_logits, **compile_kw)
+
+    def _build_packed_weights(self) -> None:
+        """Pack frozen projection families once; original model weights stay untouched."""
+        qkv_weights, qkv_biases, gate_up_weights = [], [], []
+        for layer in self.layers:
+            attn = layer.self_attn
+            qkv_weights.append(
+                torch.cat(
+                    [attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight], dim=0
+                ).contiguous()
+            )
+            biases = (attn.q_proj.bias, attn.k_proj.bias, attn.v_proj.bias)
+            qkv_biases.append(
+                torch.cat(biases, dim=0).contiguous() if biases[0] is not None else None
+            )
+            gate_up_weights.append(
+                torch.cat([layer.mlp.gate_proj.weight, layer.mlp.up_proj.weight], dim=0).contiguous()
+            )
+        self._qkv_weights = tuple(qkv_weights)
+        self._qkv_biases = tuple(qkv_biases)
+        self._gate_up_weights = tuple(gate_up_weights)
+
+    def _ensure_rope(self, dtype: torch.dtype, device: torch.device) -> dict[str, tuple[Tensor, Tensor]]:
+        rope = self._rope
+        if rope is None or next(iter(rope.values()))[0].dtype != dtype or next(iter(rope.values()))[
+            0
+        ].device != device:
+            marker = torch.empty(1, 1, self.hidden_size, dtype=dtype, device=device)
+            pos_ids = torch.arange(self.window, device=device).unsqueeze(0)
+            self._rope = {
+                lt: self.rotary(marker, pos_ids, lt) for lt in set(self.layer_types)
+            }
+        return self._rope
 
     def mix(self, h_s: Tensor, h_d: Tensor, alpha, beta) -> Tensor:
         ratio = h_d.norm(dim=-1, keepdim=True) / h_s.norm(dim=-1, keepdim=True).clamp_min(
             self.cfg.eps
         )
         return beta * h_d + alpha * ratio * h_s
+
+    def _layer(self, i: int, x: Tensor, pe, cache: DualCache | None) -> Tensor:
+        """Gemma3 decoder layer with packed QKV and gate/up projections."""
+        layer = self.layers[i]
+        attn = layer.self_attn
+        residual = x
+        h = layer.input_layernorm(x)
+
+        q_size = self.q_heads * self.head_dim
+        kv_size = self.kv_heads * self.head_dim
+        qkv = F.linear(h, self._qkv_weights[i], self._qkv_biases[i])
+        q, k, v = qkv.split((q_size, kv_size, kv_size), dim=-1)
+        input_shape = h.shape[:-1]
+        q = q.view(*input_shape, self.q_heads, self.head_dim).transpose(1, 2)
+        k = k.view(*input_shape, self.kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(*input_shape, self.kv_heads, self.head_dim).transpose(1, 2)
+        q = attn.q_norm(q)
+        k = attn.k_norm(k)
+        q, k = apply_rotary_pos_emb(q, k, *pe)
+
+        if cache is None:
+            a = _fa2_prefill_op(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn.scaling
+            )
+        else:
+            a = _fa2_op(
+                q.transpose(1, 2),
+                *cache.views(i),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                cache.seqlens,
+                attn.scaling,
+            )
+        a = a.reshape(*input_shape, -1).contiguous()
+        h = residual + layer.post_attention_layernorm(attn.o_proj(a))
+
+        residual = h
+        h = layer.pre_feedforward_layernorm(h)
+        gate, up = F.linear(h, self._gate_up_weights[i]).chunk(2, dim=-1)
+        h = layer.mlp.down_proj(layer.mlp.act_fn(gate) * up)
+        return residual + layer.post_feedforward_layernorm(h)
+
+    def _prefill(self, input_ids: Tensor, cos_f, sin_f, cos_s, sin_s) -> Tensor:
+        h = self.embed(input_ids)
+        for i in range(self.cfg.dest + 1):
+            pe = (cos_f, sin_f) if self.layer_types[i] == "full_attention" else (cos_s, sin_s)
+            h = self._layer(i, h, pe, None)
+        return h
 
     def _slab(self, x: Tensor, cos_f, sin_f, cos_s, sin_s):
         """One step over layers dest+1..top (the t=0 step runs this body
@@ -247,20 +384,38 @@ class RecirculationEngine:
         h_s = x[: cache.B]
         for i in range(self.cfg.dest + 1, self.n_layers):
             pe = (cos_f, sin_f) if self.layer_types[i] == "full_attention" else (cos_s, sin_s)
-            x = self.layers[i](
-                x,
-                position_embeddings=pe,
-                attention_mask=None,
-                past_key_values=cache,
-                wire_cache=cache,
-            )
+            x = self._layer(i, x, pe, cache)
             if i == self.cfg.source:
                 h_s = x[: cache.B]
         return x, h_s
 
+    def _step(self, h_t: Tensor, h_prev: Tensor, h_s_prev: Tensor, alpha, beta, *rope):
+        x = torch.cat([h_t, self.mix(h_s_prev, h_prev, alpha, beta)])
+        return self._slab(x, *rope)
+
+    def _logits_chunk(self, h: Tensor) -> Tensor:
+        lg = self.lm_head(self.final_norm(h))
+        if self.softcap is not None:
+            lg = torch.tanh(lg / self.softcap) * self.softcap
+        return lg
+
+    @staticmethod
+    def _nll_from_logits(lg: Tensor, targets: Tensor) -> Tensor:
+        logprobs = torch.log_softmax(lg.float(), dim=-1)
+        return -logprobs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+
+    def _nll_chunk(self, h: Tensor, targets: Tensor) -> Tensor:
+        return self._nll_from_logits(self._logits_chunk(h), targets)
+
     def _ensure_cache(self, B: int, T: int, dtype, device) -> DualCache:
         c = self._cache
-        if c is None or c.B != B or c.k.shape[2] < T or c.k.dtype != dtype:
+        if (
+            c is None
+            or c.B != B
+            or c.k.shape[2] < T
+            or c.k.dtype != dtype
+            or c.k.device != torch.device(device)
+        ):
             self._cache = DualCache(
                 self.n_layers - self.cfg.dest - 1,
                 self.cfg.dest + 1,
@@ -268,9 +423,11 @@ class RecirculationEngine:
                 self.kv_heads,
                 T,
                 self.head_dim,
+                self.hidden_size,
                 dtype,
                 device,
             )
+            self._cache.bind_rope(self._ensure_rope(dtype, torch.device(device)))
         return self._cache
 
     @torch.inference_mode()
@@ -294,75 +451,70 @@ class RecirculationEngine:
         if dtype not in (torch.bfloat16, torch.float16):
             raise ValueError(f"the canonical wire is half-precision only, model is {dtype}")
         cfg = self.cfg
-        pos_ids = torch.arange(T, device=device).unsqueeze(0)
-        h = self.embed(input_ids)
-        rope = {lt: self.rotary(h, pos_ids, lt) for lt in set(self.layer_types)}
+        rope = self._ensure_rope(dtype, device)
+        cf, sf = rope["full_attention"]
+        cs, ss = rope["sliding_attention"]
 
         # Pass A: layers 0..dest for all columns in parallel (exact: the
         # refresh never touches these layers, so nothing here ever sees
         # recirculated state). No cache — slab KVs are never read later.
-        for i in range(cfg.dest + 1):
-            h = self.layers[i](
-                h,
-                position_embeddings=rope[self.layer_types[i]],
-                attention_mask=None,
-                past_key_values=None,
-            )
-        h_dest = h  # [B, T, D]: first-pass layer-dest output of every column
+        h_dest = self._prefill_c(
+            input_ids, cf[:, :T], sf[:, :T], cs[:, :T], ss[:, :T]
+        )
 
         # Serial slab: layers dest+1..top, batched dual pass. Slicing
         # rope_dual at [t-1 : t] yields (position t for the first half,
         # position t-1 for the second).
         cache = self._ensure_cache(B, T, dtype, device)
-        tops = torch.empty(B, T, h.shape[-1], dtype=dtype, device=device)
-        rope_dual = (
-            {
-                lt: (
-                    torch.cat([c[:, 1:].expand(B, -1, -1), c[:, : T - 1].expand(B, -1, -1)]),
-                    torch.cat([s[:, 1:].expand(B, -1, -1), s[:, : T - 1].expand(B, -1, -1)]),
-                )
-                for lt, (c, s) in rope.items()
-            }
-            if T > 1
-            else {}
-        )
+        tops = cache.tops[:, :T]
+        rope_dual = cache.rope_dual
         h_s_prev: Tensor | None = None
         for t in range(T):
             cache.step(t)
             if t == 0:
-                cf, sf = rope["full_attention"]
-                cs, ss = rope["sliding_attention"]
-                x, h_s = self._slab(h_dest[:, :1], cf[:, :1], sf[:, :1], cs[:, :1], ss[:, :1])
+                x, h_s = self._slab_first_c(
+                    h_dest[:, :1], cf[:, :1], sf[:, :1], cs[:, :1], ss[:, :1]
+                )
             else:
                 if alpha_fn is None:
                     a = cfg.alpha_at(t - 1)
                     ab = (a, 1.0 - a)
                 else:
                     ab = alpha_fn(t - 1, h_s_prev, h_dest[:, t - 1 : t])
-                x = torch.cat([h_dest[:, t : t + 1], self.mix(h_s_prev, h_dest[:, t - 1 : t], *ab)])
                 cf, sf = rope_dual["full_attention"]
                 cs, ss = rope_dual["sliding_attention"]
-                x, h_s = self._slab_c(
-                    x, cf[:, t - 1 : t], sf[:, t - 1 : t], cs[:, t - 1 : t], ss[:, t - 1 : t]
+                x, h_s = self._step_c(
+                    h_dest[:, t : t + 1],
+                    h_dest[:, t - 1 : t],
+                    h_s_prev,
+                    *ab,
+                    cf[:, t - 1 : t],
+                    sf[:, t - 1 : t],
+                    cs[:, t - 1 : t],
+                    ss[:, t - 1 : t],
                 )
                 cache.commit(t)
             tops[:, t : t + 1] = x[:B]
             h_s_prev = h_s
 
         # Deferred readout: chunked over positions to bound the fp32
-        # softmax footprint at Gemma3's 262k vocab (~1.5 GB per chunk).
+        # softmax footprint at Gemma3's 262k vocab. The NLL-only compiled
+        # path fuses log-softmax + target gather and never materializes the
+        # fp32 [tokens, vocab] tensor.
         nlls, logits, chunk = [], [], max(1, 1024 // B)
-        for i in range(0, T, chunk):
-            lg = self.lm_head(self.final_norm(tops[:, i : i + chunk]))
-            if self.softcap is not None:
-                lg = torch.tanh(lg / self.softcap) * self.softcap
-            if return_logits:
+        if return_logits:
+            for i in range(0, T, chunk):
+                lg = self._logits_chunk_c(tops[:, i : i + chunk])
                 logits.append(lg)
-            hi = min(i + chunk, T - 1)
-            if i < hi:
-                logprobs = torch.log_softmax(lg[:, : hi - i].float(), dim=-1)
+                hi = min(i + chunk, T - 1)
+                if i < hi:
+                    targets = input_ids[:, i + 1 : hi + 1]
+                    nlls.append(self._nll_from_logits_c(lg[:, : hi - i], targets))
+        else:
+            for i in range(0, T - 1, chunk):
+                hi = min(i + chunk, T - 1)
                 targets = input_ids[:, i + 1 : hi + 1]
-                nlls.append(-logprobs.gather(-1, targets.unsqueeze(-1)).squeeze(-1))
+                nlls.append(self._nll_chunk_c(tops[:, i:hi], targets))
         nll = torch.cat(nlls, dim=1) if nlls else torch.empty(B, 0, device=device)
         return nll, (torch.cat(logits, dim=1) if return_logits else None)
 
