@@ -202,6 +202,8 @@ class DualCache:
         self.rows = batch
         self.tops = torch.empty(batch, max_len, hidden_size, dtype=dtype, device=device)
         self.rope_dual: dict[str, tuple[Tensor, Tensor]] = {}
+        self.alpha: Tensor | None = None
+        self.beta: Tensor | None = None
 
     def bind_rope(self, rope: dict[str, tuple[Tensor, Tensor]]) -> None:
         """Materialize stable dual-lane RoPE buffers once per shape bucket."""
@@ -223,6 +225,11 @@ class DualCache:
             )
             for lt, (c, s) in rope.items()
         }
+
+    def bind_alpha(self, cfg: WireConfig) -> None:
+        values = [cfg.alpha_at(t) for t in range(self.k.shape[2])]
+        self.alpha = torch.tensor(values, dtype=self.k.dtype, device=self.k.device)
+        self.beta = 1 - self.alpha
 
     def step(self, t: int) -> None:
         if t == 0:
@@ -428,6 +435,7 @@ class RecirculationEngine:
                 device,
             )
             self._cache.bind_rope(self._ensure_rope(dtype, torch.device(device)))
+            self._cache.bind_alpha(self.cfg)
         return self._cache
 
     @torch.inference_mode()
@@ -477,10 +485,15 @@ class RecirculationEngine:
                 )
             else:
                 if alpha_fn is None:
-                    a = cfg.alpha_at(t - 1)
-                    ab = (a, 1.0 - a)
+                    ab = (cache.alpha[t - 1], cache.beta[t - 1])
                 else:
                     ab = alpha_fn(t - 1, h_s_prev, h_dest[:, t - 1 : t])
+                    ab = tuple(
+                        q
+                        if isinstance(q, Tensor)
+                        else torch.tensor(q, dtype=dtype, device=device)
+                        for q in ab
+                    )
                 cf, sf = rope_dual["full_attention"]
                 cs, ss = rope_dual["sliding_attention"]
                 x, h_s = self._step_c(
