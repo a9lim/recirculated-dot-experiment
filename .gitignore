@@ -1,0 +1,35 @@
+# Generated research inputs and run products are local, reproducible artifacts.
+references/**
+!references/.gitkeep
+!references/refs.yaml
+data/**
+!data/.gitkeep
+!data/evidence/
+data/evidence/**
+!data/evidence/.gitkeep
+!data/summary/
+!data/summary/**
+figures/**
+!figures/README.md
+!figures/public/
+!figures/public/**
+tmp/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.env
+.DS_Store
+.idea/
+.vscode/
+.claude/
+
+# run logs (regeneration helper output)
+logs/**
+!logs/.gitkeep

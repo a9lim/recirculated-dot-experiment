@@ -1,0 +1,27 @@
+# Reference manifest. PDFs are gitignored; re-fetch with the URLs below.
+- id: recirculation
+  file: recirculation-2608.17981.pdf
+  arxiv: "2608.17981"
+  url: https://arxiv.org/abs/2608.17981
+  title: "Recirculation"
+  authors: Mozer, Siddiqui, Sawyer, Sanyal, Liu (Google DeepMind)
+  year: 2026
+  role: >
+    Core method. Inference-time recurrence for off-the-shelf models: leak
+    prev-step deep-layer activation into a shallow layer (convex mix,
+    norm-matched, alpha~0.1). Adaptive variant trains a small MLP producing
+    per-token vector alpha/beta with base frozen; matches full fine-tuning
+    on ppl. Gemma3 (Peri-LN) most receptive; source/dest {11,4} for 1B.
+
+- id: dot-by-dot
+  file: dot-by-dot-2404.15758.pdf
+  arxiv: "2404.15758"
+  url: https://arxiv.org/abs/2404.15758
+  title: "Let's Think Dot by Dot: Hidden Computation in Transformer LMs"
+  authors: Pfau, Merrill, Bowman (NYU)
+  year: 2024
+  role: >
+    Filler-token baseline and negative result we aim to overturn: fillers
+    add parallel width only (stay in TC0, no serial state across filler
+    positions) and their use is learnable only with dense parallelizable
+    decomposition supervision.
