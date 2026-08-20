@@ -709,17 +709,10 @@ class RecirculationEngine:
             self._steady_graph = None
         return self._cache
 
-    @torch.inference_mode()
-    def teacher_forced(
-        self, input_ids: Tensor, alpha_fn=None, return_logits: bool = False
-    ) -> tuple[Tensor, Tensor | None]:
-        """Full-scope recirculation; returns (nll [B, T-1], logits | None).
-
-        alpha_fn(t, h_s, h_d) -> (alpha, beta), scalars or [B, 1, D]
-        tensors; None uses the config constants with the ramp (convex,
-        beta = 1 - alpha_t). This is the hook the adaptive gate MLP
-        replaces later.
-        """
+    def _run(self, input_ids: Tensor, alpha_fn) -> BranchCache:
+        """Pass A + the serial slab; fills cache.tops[:, :T] with the final
+        layer's states. Shared core of the two readouts (teacher-forced NLL
+        and answer-position logits); callers hold inference_mode."""
         B, T = input_ids.shape
         if not 1 <= T <= self.window:
             raise ValueError(f"wire requires 1 <= T <= sliding_window ({self.window})")
@@ -812,6 +805,22 @@ class RecirculationEngine:
                 )
                 tops[:, t : t + 1] = x[0::2]
                 h_s_prev = h_s
+        return cache
+
+    @torch.inference_mode()
+    def teacher_forced(
+        self, input_ids: Tensor, alpha_fn=None, return_logits: bool = False
+    ) -> tuple[Tensor, Tensor | None]:
+        """Full-scope recirculation; returns (nll [B, T-1], logits | None).
+
+        alpha_fn(t, h_s, h_d) -> (alpha, beta), scalars or [B, 1, D]
+        tensors; None uses the config constants with the ramp (convex,
+        beta = 1 - alpha_t). This is the hook the adaptive gate MLP
+        replaces later.
+        """
+        B, T = input_ids.shape
+        cache = self._run(input_ids, alpha_fn)
+        device = input_ids.device
 
         # Deferred readout: chunked over positions to bound the fp32
         # softmax footprint at Gemma3's 262k vocab. Scratch-padding the
@@ -850,3 +859,16 @@ class RecirculationEngine:
     def teacher_forced_logits(self, input_ids: Tensor, alpha_fn=None) -> Tensor:
         """First-pass logits [B, T, V]; small T only (full-vocab memory)."""
         return self.teacher_forced(input_ids, alpha_fn, return_logits=True)[1]
+
+    @torch.inference_mode()
+    def answer_logits(self, input_ids: Tensor, alpha_fn=None) -> Tensor:
+        """Full-vocab logits [B, V] at the final position only.
+
+        The task readout (design.md D3/D4): the last think token predicts
+        the answer, so forced-choice scoring needs exactly one position —
+        no per-dot NLL is ever computed, mirroring D9's answer-only
+        supervision. Same tops and compiled head as teacher_forced_logits'
+        last column, at chunk width 1."""
+        T = input_ids.shape[1]
+        cache = self._run(input_ids, alpha_fn)
+        return self._logits_chunk_c(cache.tops[:, T - 1 : T]).squeeze(1)
