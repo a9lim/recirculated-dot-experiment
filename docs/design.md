@@ -194,6 +194,16 @@ later calls reuse the capture directly. A user-supplied adaptive
 `alpha_fn` retains the compiled eager controller until that gate itself
 has a static capture contract.
 
+Compilation is setup, not experiment runtime. G0 warms each distinct
+`(B,T)` execution shape before starting its evaluation clock, reports
+compile+capture separately, and audits Dynamo's unique-graph counter so
+a timed run fails on any recompile. Final partial batches are padded with
+duplicate rows to the established execution shape and those rows are
+discarded before scoring. Readout scratch similarly pads its final chunk,
+so the default NLL path has five compiled graphs total rather than a
+sixth tail-shape variant. Persistent Inductor caching is used normally;
+no run clears it except an explicit cold-start benchmark.
+
 Store the two attention branches by their mathematical decomposition,
 not as duplicated histories. Both queries read one physical refreshed
 prefix `0..t-2`; a one-slot side buffer holds the prior first-pass KV.

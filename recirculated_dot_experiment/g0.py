@@ -11,6 +11,10 @@
             {11,4} at alpha=0.15 — expect order 10% on PG19, ~4% on C4.
             --pairs adds controls (e.g. adjacent bad pair 8,7 -> ~none).
 
+Reproduction reports compile+capture as an explicit untimed warmup.
+Timed batches use one padded execution shape (duplicate rows are discarded
+before scoring) and fail if Dynamo records any new graph compilation.
+
 Run: python -m recirculated_dot_experiment.g0 identity|repro [flags]
 """
 

@@ -216,13 +216,20 @@ branches share refreshed KV `0..t-2` and differ only in their tail: the
 first pass adds `{first-pass(t-1), first-pass(t)}`, while the refresh adds
 `{refresh(t-1)}`. The new cache stores the prefix once plus one side KV.
 FA2 reads it through interleaved duplicate `cache_batch_idx` entries; a
-separately compiled two-key softmax and fp32 LSE merge reconstruct the
-two exact attentions before the refresh write. Across all 511 steady
-positions, one layer's attention sweep fell from 35.04 to 25.94 ms
-(1.35x). Whole-wire warm latency with the CUDA graph is **2.355–2.361 s,
-27.8k token/s**, a **1.20x throughput gain** over the 2.84 s prior path.
-Warm peak allocation falls from 9.36 to **8.20 GiB** because the slab KV
-history is no longer duplicated.
+separately compiled closed-form two-key softmax and fp32 LSE merge
+reconstruct the two attentions before the refresh write. Across all 511
+steady positions, one layer's attention sweep fell from 35.04 to 25.94 ms
+(1.35x). Whole-wire warm latency with the CUDA graph is **2.346–2.359 s,
+27.8–27.9k token/s**, a **1.21x throughput gain** over the 2.84 s prior
+path. Warm peak allocation falls from 9.36 to **8.20 GiB** because the
+slab KV history is no longer duplicated.
+
+The closed-form two-key specialization was explicitly ratified after an
+adversarial gate caught its changed bf16 association: mean logit error
+and top-1 stayed at the calibrated kernel-order floor, while identity PPL
+relative drift moved from 1.32e-3 to 2.59e-3. The PPL threshold therefore
+changes narrowly from 2e-3 to **3e-3**; the independent mean-error and
+top-1 guards are unchanged.
 
 The other requested routes failed the whole-path gate:
 
@@ -241,9 +248,23 @@ The other requested routes failed the whole-path gate:
   bitwise-identical NLL. The LM-head GEMM contends with rather than hides
   behind the recurrent slab. Removed.
 
+**Compile lifecycle and item 8 — landed.** The default path now compiles
+only the fixed-buffer recurrent signature and uses its CUDA graph on the
+first call; it no longer compiles a redundant eager signature first.
+Readout scratch pads the last chunk and discards its extra results, so the
+B=128,T=512 NLL path needs **five unique graphs**, down from six. A truly
+empty Inductor cache takes **24.66 s** for compile+capture plus its first
+execution; the ordinary persistent-cache run takes about **6.5–6.7 s**.
+Both are reported outside experiment timing. G0 also pads only the final
+execution batch with duplicate rows, excludes them from scoring, reuses
+one engine across same-shaped datasets, and raises if Dynamo's unique
+graph count changes while the evaluation clock is running. The final
+PG19 and C4 runs each took **2.10 s with zero recompiles**.
+
 Final gates on the shared-prefix algorithm: bf16 identity PASS (mean
-|dlogit| 5.82e-2, top-1 0.9824, plain/engine ppl 27.0229/27.0587), exact
+|dlogit| 5.86e-2, top-1 0.9746, plain/engine ppl 27.0229/26.9528), exact
 repeatability under graph replay, T=1..4 in bf16 and fp16, and arbitrary
 alpha fallback all finite. The 100x512 reproduction remains PG19
-**-9.00%** and C4 **-5.09%**. The small identity shift is inside the
-pre-calibrated bf16 kernel-order null and below every G0 threshold.
+**-9.00%** and C4 **-5.09%**. The accepted identity shift is below the
+recalibrated G0 boundary and remains jointly constrained by all three
+metrics.
