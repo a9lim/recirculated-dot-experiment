@@ -69,3 +69,37 @@ Codex consults (sol tier, both ran their own reproductions on jobe):
   documented next lever, deferred until training throughput actually
   binds. Not worth it at our scale: streams, FlashAttention, custom
   fused kernels, quantization, full-length eager attention.
+
+## Push-it-further pass (2026-08-20, second round)
+
+**GQA under masks — the real 4× kernel win.** FlashAttention benched
+4× faster than sdpa at the serial shape (117 vs 464 µs; q_len=1,
+kv=512, 200 rows) — but the whole gap was native GQA: HF's sdpa path
+repeat_kv's 1 KV head to 4 query heads whenever a mask is present
+(materialized copy + 4× traffic; attention here is memory-bound). At
+the causal pass-A shape FA2 and sdpa tie exactly. Fix: `_wire_sdpa`
+registered via HF's AttentionInterface — **stride-0 expand views**
+into the same fused kernel: 464 → 119 µs, bitwise-identical output,
+zero copies. Two traps documented from measurement: `enable_gqa=True`
+with a dense mask silently falls back to the math backend (3354 µs),
+and FA2 itself cannot express the per-lane dual-pass mask. FA2 is
+empirically closed: nothing left for it to win.
+
+**torch.compile — implemented, gate-exact, measured slower, parked.**
+Slab step compiles fullgraph with zero recompiles and passes the
+identity gate (1.22e-4 fp32). But the compiled graph does 4.5× the
+GPU work (37.4 vs 8.3 ms/step at B=100): inductor materializes the
+stride-0 broadcast feeding the extern attention kernel (un-doing the
+GQA win), runs static full-T attention, and fails to re-inplace the
+lane-buffer mutations (functionalization copy tax). The mutation-
+heavy inference cache is structurally compile-hostile. `--compile`
+stays as a documented experiment flag; compile belongs to the
+training path, whose D9 functional cache is mutation-free (a pure
+graph) by design.
+
+**Where the wire landed.** B=100 eager: ~10 ms/step wall vs 8.3 ms
+GPU work — ~83% GPU-bound with efficient kernels; weight traffic
+alone floors the slab near ~2 ms/step, so remaining headroom is ≤2×
+at high effort/risk. Final canonical numbers: PG19 −8.75%, C4 −5.11%,
+5 s per 100×512 windows each, identity gate exact. Journey: 73 → 5 s
+(14.6×), semantics-preserving at every step.

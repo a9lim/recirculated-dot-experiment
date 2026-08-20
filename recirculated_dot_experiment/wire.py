@@ -22,28 +22,37 @@ The implementation exploits two exact structural facts:
 
 DualCache keeps two persistent lanes per layer in one [2B] buffer —
 lane 0 the first-pass view (refreshed history + newest first-pass
-column), lane 1 the refresh view (refreshed history + its own recompute;
-the newest column is masked out). Returns are zero-copy views; the only
-data movement is four one-slot writes per layer per step, with lane 0's
-refresh committed via `commit(i)` after that layer's attention has
-consumed its view.
+column), lane 1 the refresh view (refreshed history + its own
+recompute). All slot writes are tensor-index ops so the compiled slab
+specializes on shapes only, never on the step index. Visibility comes
+from a running additive mask, opened progressively from outside the
+graph: at step t, lane 0 gains slot t and lane 1 gains slot t-1 (lane
+1's slot t stays masked — its content after the batched write is moot).
+Lane 0's refresh of slot t-1 is committed via `commit(i)` after that
+layer's attention has consumed its view. In eager mode the cache
+returns the visible prefix; in compiled mode it returns the full
+buffer and the mask alone carries visibility (stale/garbage slots are
+fully masked).
+
+`compile_mode` compiles the 21-layer slab step with
+torch.compile(fullgraph=True, dynamic=False) — one graph per (B, T,
+dtype) combination, first call pays the compile. The t=0 single-pass
+step always runs eager.
 
 NLL / logits are computed chunked at the end from collected top hiddens
 — per-step fp32 softmax over Gemma3's 262k vocab would dominate runtime
 and memory.
 
 Requirements the constructor enforces: sdpa attention (pass A relies on
-sdpa synthesizing causality for maskless q_len > 1; eager would attend
-bidirectionally there) and sequences within one sliding window, where
-sliding and full attention coincide. `final_logit_softcapping` is
-applied when the config carries it (None on Gemma3-1B).
+sdpa synthesizing causality for maskless q_len > 1; eager attention
+would attend bidirectionally there) and sequences within one sliding
+window, where sliding and full attention coincide.
+`final_logit_softcapping` is applied when the config carries it (None
+on Gemma3-1B).
 
 Inference-only in v0 (`inference_mode`): the in-place lane buffers break
 autograd. The BPTT training path gets a functional token-chunked cache
-(design.md, "training-path design") instead. The next perf lever, when
-training throughput binds, is torch.compile over the slab step with
-bucketed KV lengths — measured 4.8x on the slab in isolation; the
-two-lane cache is the shape-stability groundwork for it.
+(design.md D9) instead.
 
 Layer indexing: `source`/`dest` are 0-based indices into model.layers,
 and the tapped value is the hidden state *after* that layer. G0
@@ -57,6 +66,36 @@ from dataclasses import dataclass
 
 import torch
 from torch import Tensor
+from transformers import AttentionInterface
+from transformers.integrations.sdpa_attention import sdpa_attention_forward
+
+
+def _wire_sdpa(module, query, key, value, attention_mask, **kwargs):
+    """sdpa with zero-copy GQA under masks. HF's stock sdpa path repeat_kv's
+    K/V to all query heads whenever a mask is present — a materialized copy
+    plus 4x attention traffic at Gemma3's 4:1 head ratio, and the dual-pass
+    attention is memory-bound. Stride-0 expand views hit the same fused
+    kernel with 1-head traffic (measured 464 -> 119 us at q_len=1, kv=512,
+    B=200; bitwise-identical output). enable_gqa is NOT the answer: with a
+    dense mask it falls back to the math backend (3354 us). Maskless calls
+    (pass A, t=0) defer to stock."""
+    if attention_mask is None:
+        return sdpa_attention_forward(module, query, key, value, None, **kwargs)
+    if module.num_key_value_groups > 1 and key.shape[1] == 1:
+        key = key.expand(-1, query.shape[1], -1, -1)
+        value = value.expand(-1, query.shape[1], -1, -1)
+    elif module.num_key_value_groups > 1:  # kv_heads > 1: strides can't merge
+        from transformers.integrations.sdpa_attention import repeat_kv
+
+        key = repeat_kv(key, module.num_key_value_groups)
+        value = repeat_kv(value, module.num_key_value_groups)
+    out = torch.nn.functional.scaled_dot_product_attention(
+        query, key, value, attn_mask=attention_mask, scale=kwargs.get("scaling")
+    )
+    return out.transpose(1, 2).contiguous(), None
+
+
+AttentionInterface.register("wire_sdpa", _wire_sdpa)
 
 
 @dataclass
@@ -76,9 +115,9 @@ class WireConfig:
 class DualCache:
     """Two-lane KV store for the serial slab with same-snapshot dual-pass
     views. `update` matches the transformers Cache calling convention:
-    attention attends over exactly what it returns (plus the engine's
-    mask on lane 1's newest slot). Lane buffers are allocated lazily per
-    layer, so only slab layers ever hold memory."""
+    attention attends over exactly what it returns, restricted by the
+    engine's running mask. Lane buffers are allocated lazily per layer,
+    so only slab layers ever hold memory."""
 
     def __init__(
         self,
@@ -98,6 +137,9 @@ class DualCache:
         self.pending: dict[int, tuple[Tensor, Tensor]] = {}
         self.t = 0
         self.dual = False  # False: plain single pass at slot t (t == 0)
+        self.static = False  # True: full-length returns (compiled mode)
+        self.t_idx: Tensor | None = None  # slot t as a [1] index tensor
+        self.tm1_idx: Tensor | None = None  # slot t-1
 
     def _lane(self, store: dict[int, Tensor], layer_idx: int) -> Tensor:
         if layer_idx not in store:
@@ -105,43 +147,49 @@ class DualCache:
         return store[layer_idx]
 
     def update(self, key_states: Tensor, value_states: Tensor, layer_idx: int, *a, **kw):
-        B, t = self.B, self.t
+        B = self.B
         k, v = self._lane(self.k, layer_idx), self._lane(self.v, layer_idx)
         if not self.dual:
-            k[:, :, t : t + 1] = torch.cat([key_states] * 2)
-            v[:, :, t : t + 1] = torch.cat([value_states] * 2)
-            return k[:B, :, : t + 1], v[:B, :, : t + 1]
-        k1, k2 = key_states[:B], key_states[B:]
-        v1, v2 = value_states[:B], value_states[B:]
-        k[:B, :, t : t + 1] = k1
-        k[B:, :, t : t + 1] = k1  # lane 1's newest slot is masked; content moot
-        k[B:, :, t - 1 : t] = k2  # lane 1 attends its own recomputed t-1
-        v[:B, :, t : t + 1] = v1
-        v[B:, :, t : t + 1] = v1
-        v[B:, :, t - 1 : t] = v2
+            k[:, :, self.t : self.t + 1] = torch.cat([key_states] * 2)
+            v[:, :, self.t : self.t + 1] = torch.cat([value_states] * 2)
+            return k[:B, :, : self.t + 1], v[:B, :, : self.t + 1]
+        # slot t: k1 -> lane 0; k2 lands in lane 1's slot t, which is
+        # masked until step t+1 overwrites it (content moot)
+        k.index_copy_(2, self.t_idx, key_states)
+        v.index_copy_(2, self.t_idx, value_states)
+        k2, v2 = key_states[B:], value_states[B:]
+        k[B:].index_copy_(2, self.tm1_idx, k2)  # lane 1 attends its own recompute
+        v[B:].index_copy_(2, self.tm1_idx, v2)
         self.pending[layer_idx] = (k2, v2)
-        return k[:, :, : t + 1], v[:, :, : t + 1]
+        if self.static:
+            return k, v
+        return k[:, :, : self.t + 1], v[:, :, : self.t + 1]
 
     def commit(self, layer_idx: int) -> None:
         """Refresh lane 0's slot t-1 — call after this layer's attention
         has consumed its first-pass view (same-snapshot semantics)."""
         k2, v2 = self.pending.pop(layer_idx)
-        self.k[layer_idx][: self.B, :, self.t - 1 : self.t] = k2
-        self.v[layer_idx][: self.B, :, self.t - 1 : self.t] = v2
+        self.k[layer_idx][: self.B].index_copy_(2, self.tm1_idx, k2)
+        self.v[layer_idx][: self.B].index_copy_(2, self.tm1_idx, v2)
 
 
 class RecirculationEngine:
-    """Wraps a Gemma3ForCausalLM (weights untouched, model in eval mode)."""
+    """Wraps a Gemma3ForCausalLM (weights untouched, model in eval mode).
 
-    def __init__(self, model, cfg: WireConfig):
+    compile_mode: None (eager), "default", or "reduce-overhead" — passed
+    to torch.compile for the slab step.
+    """
+
+    def __init__(self, model, cfg: WireConfig, compile_mode: str | None = None):
         mc = model.config
         if not 0 <= cfg.dest < cfg.source < mc.num_hidden_layers:
             raise ValueError(f"need 0 <= dest < source < {mc.num_hidden_layers}")
         # pass A relies on sdpa synthesizing causality for maskless q_len > 1;
         # eager attention would attend bidirectionally there (Codex repro:
         # 0.21 max logit error on a tiny model)
-        if mc._attn_implementation != "sdpa":
+        if mc._attn_implementation not in ("sdpa", "wire_sdpa"):
             raise ValueError(f"engine requires sdpa attention, got {mc._attn_implementation!r}")
+        mc._attn_implementation = "wire_sdpa"  # native-GQA sdpa (see _wire_sdpa)
         self.model = model
         self.cfg = cfg
         inner = model.model
@@ -156,12 +204,43 @@ class RecirculationEngine:
         self.head_dim = mc.head_dim
         self.window = mc.sliding_window
         self.softcap = getattr(mc, "final_logit_softcapping", None)  # None on Gemma3-1B
+        self._cache: DualCache | None = None
+        self._mask: Tensor | None = None
+        self._slab_c = None
+        if compile_mode is not None:
+            self._slab_c = torch.compile(self._slab, fullgraph=True, dynamic=False, mode=compile_mode)
 
     def mix(self, h_s: Tensor, h_d: Tensor, alpha, beta) -> Tensor:
         ratio = h_d.norm(dim=-1, keepdim=True) / h_s.norm(dim=-1, keepdim=True).clamp_min(
             self.cfg.eps
         )
         return beta * h_d + alpha * ratio * h_s
+
+    def _slab(self, x: Tensor, mask: Tensor | None, cos_f, sin_f, cos_s, sin_s):
+        """One step over layers dest+1..top; the single shared body for
+        eager and compiled paths."""
+        cache = self._cache
+        B = cache.B
+        h_s = x[:B]
+        for i in range(self.cfg.dest + 1, self.n_layers):
+            pe = (cos_f, sin_f) if self.layer_types[i] == "full_attention" else (cos_s, sin_s)
+            x = self.layers[i](
+                x, position_embeddings=pe, attention_mask=mask, past_key_values=cache
+            )
+            if i == self.cfg.source:
+                h_s = x[:B]
+            if cache.dual:
+                cache.commit(i)
+        return x, h_s
+
+    def _ensure_buffers(self, B: int, T: int, dtype, device) -> tuple[DualCache, Tensor]:
+        c = self._cache
+        if c is None or c.B != B or c.shape[2] < T or c.dtype != dtype:
+            self._cache = DualCache(B, self.kv_heads, T, self.head_dim, dtype, device)
+            self._mask = torch.empty(2 * B, 1, 1, T, dtype=dtype, device=device)
+        elif self._mask.shape[-1] < T:
+            self._mask = torch.empty(2 * B, 1, 1, T, dtype=dtype, device=device)
+        return self._cache, self._mask[..., :T] if self._mask.shape[-1] != T else self._mask
 
     @torch.inference_mode()
     def teacher_forced(
@@ -199,11 +278,13 @@ class RecirculationEngine:
         # Serial slab: layers dest+1..top, batched dual pass. Slicing
         # rope_dual at [t-1 : t] yields (position t for the first half,
         # position t-1 for the second).
-        slab = range(cfg.dest + 1, self.n_layers)
-        cache = DualCache(B, self.kv_heads, T, self.head_dim, dtype, device)
+        cache, mask_buf = self._ensure_buffers(B, T, dtype, device)
+        compiled = self._slab_c is not None and T > 1
+        cache.static = compiled
         neg = torch.finfo(dtype).min
+        mask_buf.fill_(neg)
+        idxs = torch.arange(T, device=device)
         tops = torch.empty(B, T, h.shape[-1], dtype=dtype, device=device)
-        mask_buf = torch.zeros(2 * B, 1, 1, T, dtype=dtype, device=device)
         rope_dual = (
             {
                 lt: (
@@ -219,9 +300,12 @@ class RecirculationEngine:
         for t in range(T):
             if t == 0:
                 cache.t, cache.dual = 0, False
-                x = h_dest[:, :1]
-                mask = None
-                pe = {lt: (c[:, :1], s[:, :1]) for lt, (c, s) in rope.items()}
+                cf, sf = rope["full_attention"]
+                cs, ss = rope["sliding_attention"]
+                x, h_s = self._slab(
+                    h_dest[:, :1], None, cf[:, :1], sf[:, :1], cs[:, :1], ss[:, :1]
+                )
+                mask_buf[:B, ..., 0] = 0.0
             else:
                 if alpha_fn is None:
                     a = cfg.alpha_at(t - 1)
@@ -230,23 +314,17 @@ class RecirculationEngine:
                     ab = alpha_fn(t - 1, h_s_prev, h_dest[:, t - 1 : t])
                 x = torch.cat([h_dest[:, t : t + 1], self.mix(h_s_prev, h_dest[:, t - 1 : t], *ab)])
                 cache.t, cache.dual = t, True
-                mask = mask_buf[:, :, :, : t + 1]
-                mask[B:, ..., t] = neg  # second half runs concurrently: no slot t
-                pe = {lt: (c[:, t - 1 : t], s[:, t - 1 : t]) for lt, (c, s) in rope_dual.items()}
-            for i in slab:
-                x = self.layers[i](
-                    x,
-                    position_embeddings=pe[self.layer_types[i]],
-                    attention_mask=mask,
-                    past_key_values=cache,
-                )
-                if i == cfg.source:
-                    h_s = x[:B]
-                if t:
-                    cache.commit(i)
+                cache.t_idx, cache.tm1_idx = idxs[t : t + 1], idxs[t - 1 : t]
+                mask_buf[:B, ..., t] = 0.0  # lane 0 gains its own slot t
+                mask_buf[B:, ..., t - 1] = 0.0  # lane 1 gains its recomputed t-1
+                cf, sf = rope_dual["full_attention"]
+                cs, ss = rope_dual["sliding_attention"]
+                pe4 = (cf[:, t - 1 : t], sf[:, t - 1 : t], cs[:, t - 1 : t], ss[:, t - 1 : t])
+                if compiled:
+                    x, h_s = self._slab_c(x, mask_buf, *pe4)
+                else:
+                    x, h_s = self._slab(x, mask_buf[..., : t + 1], *pe4)
             tops[:, t : t + 1] = x[:B]
-            if t:
-                mask[B:, ..., t] = 0  # restore the reusable mask buffer
             h_s_prev = h_s
 
         # Deferred readout: chunked over positions to bound the fp32

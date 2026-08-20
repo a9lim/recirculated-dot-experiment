@@ -102,6 +102,13 @@ def main() -> None:
         default=None,
         help="extra source,dest pairs to run as controls, e.g. '8,7;12,4'",
     )
+    p.add_argument(
+        "--compile",
+        nargs="?",
+        const="default",
+        default=None,
+        help="torch.compile the slab step ('default' or 'reduce-overhead')",
+    )
     args = p.parse_args()
 
     device = args.device or (
@@ -119,7 +126,9 @@ def main() -> None:
         ids = torch.tensor(windows, device=device)
         base = model(ids).logits.float()
         engine = RecirculationEngine(
-            model, WireConfig(args.source, args.dest, alpha=0.0, ramp_steps=0)
+            model,
+            WireConfig(args.source, args.dest, alpha=0.0, ramp_steps=0),
+            compile_mode=args.compile,
         )
         ours = engine.teacher_forced_logits(ids).float()
         diff = (ours - base).abs()
@@ -145,7 +154,9 @@ def main() -> None:
         print(f"  baseline           ppl {base:8.3f}          ({time.time() - t0:.0f}s)")
         for s, d in pairs:
             engine = RecirculationEngine(
-                model, WireConfig(s, d, alpha=args.alpha, ramp_steps=args.ramp)
+                model,
+                WireConfig(s, d, alpha=args.alpha, ramp_steps=args.ramp),
+                compile_mode=args.compile,
             )
             def engine_nll(ids, engine=engine):
                 nll, _ = engine.teacher_forced(ids)

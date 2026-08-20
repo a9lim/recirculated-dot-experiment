@@ -135,9 +135,12 @@ supervised answer positions — never on dots. Before any training
 run: a gradient gate (B=1, span 3–4) comparing the functional dual
 cache against an out-of-place sequential reference for loss and
 grads of the embedding row + gate MLP. Curriculum LR rule per D6.
-torch.compile over the slab step (bucketed KV lengths; measured 4.8×
-on the slab) is the next perf lever, deferred until training
-throughput binds.
+torch.compile belongs to THIS path, not the inference wire: the
+functional cache is mutation-free, so the graph is pure and inductor
+has nothing to functionalize — the measured compile losses on the
+inference wire (broadcast materialization, non-re-inplaced mutations;
+findings 2026-08-20 round 2) do not apply. Keep the `_wire_sdpa`
+stride-0 GQA expansion in the training attention path too.
 
 ## Open
 
