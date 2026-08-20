@@ -9,7 +9,10 @@ license-files = ["LICENSE"]
 authors = [{ name = "a9lim", email = "mx@a9l.im" }]
 dependencies = [
     "torch>=2.8",
-    "transformers>=5.15",
+    # ~= pin: the wire drives Gemma3 layer internals and relies on private
+    # contracts (layer returns a tensor, cache.update(k,v,idx), sdpa maskless
+    # q_len==1 semantics); bump only with the G0 identity gate green
+    "transformers~=5.15.1",
     "datasets>=4.6",
 ]
 

@@ -31,3 +31,41 @@ Engine cost: ~73 s per 100×512 windows (bf16, batch 16, 4090).
 
 **Gate G0 is passed.** The wire is trustworthy; tasks and training
 build on it.
+
+## Wire optimization pass (2026-08-20)
+
+73s → 5s per 100×512-token windows (14.6×), perplexity invariant at
+every step (20.99–21.02, bf16 noise; identity gate exact throughout):
+
+1. **Pass A** — layers 0..dest never see refreshed state (refresh only
+   writes dest+1..top), so the bottom slab prefills in parallel for
+   the whole sequence, exactly. Serial work drops to the 21-layer slab.
+2. **Dual-pass batching** — first pass of column t and second pass of
+   column t−1 share a cache snapshot (the paper's concurrency), so
+   they run as one [2B] call: 48 → 21 layer calls per step. 73→38s.
+3. **Deferred chunked readout** — per-step fp32 softmax over the 262k
+   vocab replaced by end-of-run chunked lm_head/NLL (~1.5 GB bound).
+4. **Batch scaling** — the loop is launch-bound, so batch rides free:
+   38s (B=16) → 10s (B=64) → 5s (B=100). Same-code B=16 is 33s.
+5. **Two-lane DualCache** — per-layer lanes in one [2B] buffer; views
+   are zero-copy, data movement is four one-slot writes + one commit
+   per layer per step (replaces two full-prefix cats). Modest now
+   (launch-bound), but it is the shape-stability groundwork for
+   torch.compile.
+
+Codex consults (sol tier, both ran their own reproductions on jobe):
+
+- *Correctness (adversarial, fp32 sequential reference, agreement
+  2.76e-7 across edge configs)*: snapshot/commit ordering, dual-pass
+  visibility, rope alignment, GQA (kv_heads 1/2/4), boundaries, ramp
+  association, NLL chunking — all held. Two real catches, both fixed:
+  pass A is causal only under sdpa (eager attends bidirectionally →
+  engine now asserts sdpa), and `final_logit_softcapping` was bypassed
+  (None on Gemma3-1B, latent for other variants → now applied).
+  transformers pinned `~=5.15.1` (the wire drives private layer/cache
+  contracts); the identity gate is the contract test for bumps.
+- *Performance*: compiled 21-layer slab measured 11.5 → 2.4 ms (4.8×)
+  with fixed shapes — torch.compile with bucketed KV lengths is the
+  documented next lever, deferred until training throughput actually
+  binds. Not worth it at our scale: streams, FlashAttention, custom
+  fused kernels, quantization, full-length eager attention.

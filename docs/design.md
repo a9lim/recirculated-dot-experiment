@@ -122,6 +122,23 @@ index-assignable tensor — a deliberate deviation from the paper's
 trust. PG19 comes from the emozilla/pg19 parquet mirror (datasets>=5
 refuses the script-based deepmind/pg19).
 
+**D9 — training-path design.** (2026-08-20, incorporating the Codex
+perf consult) The BPTT path gets a *functional token-chunked cache*
+(the wire's in-place lanes are inference-only): per layer, an
+immutable detached prompt prefix + a tuple of refreshed one-token
+tensors + the newest first-pass tensor; dual views built by cat, no
+tensor participating in the graph ever overwritten. Persistent KV at
+B=64, span 40 is ~52 MiB — the real memory is saved attention
+operands (GQA repeat under masks → up to ~8 GiB), so checkpoint each
+decoder-layer call (`use_reentrant=False`). lm_head runs ONLY on
+supervised answer positions — never on dots. Before any training
+run: a gradient gate (B=1, span 3–4) comparing the functional dual
+cache against an out-of-place sequential reference for loss and
+grads of the embedding row + gate MLP. Curriculum LR rule per D6.
+torch.compile over the slab step (bucketed KV lengths; measured 4.8×
+on the slab) is the next perf lever, deferred until training
+throughput binds.
+
 ## Open
 
 - Reachability negatives are unconstrained; if shortcut heuristics

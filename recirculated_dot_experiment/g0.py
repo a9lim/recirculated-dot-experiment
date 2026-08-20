@@ -96,7 +96,7 @@ def main() -> None:
     p.add_argument("--windows", type=int, default=100)
     p.add_argument("--window-len", type=int, default=512)
     p.add_argument("--per-doc", type=int, default=2)
-    p.add_argument("--batch", type=int, default=16)
+    p.add_argument("--batch", type=int, default=64)
     p.add_argument(
         "--pairs",
         default=None,
@@ -138,8 +138,9 @@ def main() -> None:
         windows = collect_windows(name, tok, args.windows, args.window_len, args.per_doc)
         print(f"\n{name}: {len(windows)} windows x {args.window_len}")
         t0 = time.time()
+        # baseline materializes full [B, T, 262k] logits — cap its batch
         base = perplexity(
-            lambda ids: nll_sum(model(ids).logits, ids), windows, args.batch, device
+            lambda ids: nll_sum(model(ids).logits, ids), windows, min(args.batch, 16), device
         )
         print(f"  baseline           ppl {base:8.3f}          ({time.time() - t0:.0f}s)")
         for s, d in pairs:
