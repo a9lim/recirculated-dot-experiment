@@ -188,10 +188,11 @@ controller/cache boundary is superseded after direct 4090 measurement.
 The steady step is now one position-independent manual CUDA graph with
 device-resident counters: selection, recurrent-state threading, cache
 writes, and top-state storage are captured without unrolling 512 copies.
-The first call runs the regional compiled controller and builds the
-capture; later calls replay it. A user-supplied adaptive `alpha_fn`
-retains the compiled eager controller until that gate itself has a
-static capture contract.
+After the unique first step, the first call warms the fixed-buffer
+signature, captures it, restores the first-step side state, and replays;
+later calls reuse the capture directly. A user-supplied adaptive
+`alpha_fn` retains the compiled eager controller until that gate itself
+has a static capture contract.
 
 Store the two attention branches by their mathematical decomposition,
 not as duplicated histories. Both queries read one physical refreshed

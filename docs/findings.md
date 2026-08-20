@@ -205,10 +205,11 @@ device-resident current/previous indices and stable hidden, RoPE,
 sequence-length, recurrent-state, KV, and top-state buffers. Position
 selection, state threading, shared-cache writes, and counter increments
 all happen inside the graph; the host loop issues one replay per steady
-position. The first call remains the ordinary compiled path and creates
-the capture after all exact signatures are warm. Warm latency fell from
-2.836–2.838 s to 2.776–2.784 s (about 2%); arbitrary `alpha_fn` calls
-correctly retain the eager controller.
+position. The first call warms and captures the fixed-buffer signature
+after the unique first step, restores that step's side state, and uses
+the graph immediately; it does not also compile the default eager
+signature. Warm latency fell from 2.836–2.838 s to 2.776–2.784 s (about
+2%); arbitrary `alpha_fn` calls correctly retain the eager controller.
 
 **Exact shared-prefix dual-branch attention — landed.** At step `t`, the
 branches share refreshed KV `0..t-2` and differ only in their tail: the

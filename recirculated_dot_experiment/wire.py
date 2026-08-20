@@ -681,7 +681,17 @@ class RecirculationEngine:
         tops[:, :1] = x[:B]
         h_s_prev = h_s
 
-        if T > 1 and alpha_fn is None and self._steady_graph is not None:
+        if T > 1 and alpha_fn is None:
+            if self._steady_graph is None:
+                self._capture_steady_graph(cache)
+                # The exact-signature warmup writes branch/cache scratch.
+                # Re-run the unique first step to restore its side KV and
+                # source state before the first real replay.
+                cache.step(0)
+                x, h_s_prev = self._slab_first_c(
+                    h_dest[:, :1], cf[:, :1], sf[:, :1], cs[:, :1], ss[:, :1]
+                )
+                tops[:, :1] = x[:B]
             cache.h_s_state.copy_(h_s_prev)
             cache.graph_t.fill_(1)
             cache.graph_prev.zero_()
@@ -718,12 +728,6 @@ class RecirculationEngine:
                 )
                 tops[:, t : t + 1] = x[0::2]
                 h_s_prev = h_s
-
-            # Build only after the compiled step has run outside capture.
-            # This first call remains the ordinary path; later calls reuse
-            # the fixed-address graph for all steady positions.
-            if T > 1 and alpha_fn is None and self._steady_graph is None:
-                self._capture_steady_graph(cache)
 
         # Deferred readout: chunked over positions to bound the fp32
         # softmax footprint at Gemma3's 262k vocab. The NLL-only compiled
