@@ -40,9 +40,14 @@ Structure the implementation exploits, all exact:
    replay per position. flash-attn's raw PyCapsule entries are wrapped
    as torch custom ops.
 5. Gemma's frozen Q/K/V and gate/up weights are packed once, reducing
-   each decoder layer from seven GEMMs to four without changing the
-   stored model weights. RoPE, cache metadata, and output scratch are
-   shape-bucketed and reused.
+   each decoder layer from seven GEMMs to four. The original Parameters
+   become disjoint views of those packed tensors, so plain forwards and
+   serialization retain their values without keeping duplicate storage.
+6. Pass A uses one reusable B=64 compiled signature and writes each
+   chunk directly into the destination-state cache. Recurrent RoPE keeps
+   only the compact position tables; the compiled step gathers and
+   broadcasts its two live positions instead of retaining a [2B,T,D]
+   expansion.
 
 NLL / logits are computed in compiled chunks at the end from collected
 top hiddens. The NLL-only graph fuses fp32 log-softmax with target
@@ -84,6 +89,18 @@ from torch import Tensor
 from torch.nn import functional as F
 from transformers import AttentionInterface, AttentionMaskInterface
 from transformers.models.gemma3.modeling_gemma3 import apply_rotary_pos_emb
+
+
+_PREFILL_BATCH = 64
+
+
+def _clone_packed_state_dict_views(module, state_dict, prefix, local_metadata) -> None:
+    """Give serializers independent tensors without retaining them at runtime."""
+    del local_metadata
+    for name in module._wire_packed_state_dict_keys:
+        key = prefix + name
+        if key in state_dict:
+            state_dict[key] = state_dict[key].clone()
 
 
 @torch.library.custom_op("wire::fa2_prefill", mutates_args=())
@@ -307,7 +324,6 @@ class BranchCache:
         self.readout_targets = torch.empty(
             batch, top_capacity, dtype=torch.int64, device=device
         )
-        self.rope_dual: dict[str, tuple[Tensor, Tensor]] = {}
         self.alpha: Tensor | None = None
         self.beta: Tensor | None = None
         # Fixed-address storage used by the manually captured recurrent
@@ -320,18 +336,6 @@ class BranchCache:
         self.graph_t = torch.ones(1, dtype=torch.int64, device=device)
         self.graph_prev = torch.zeros(1, dtype=torch.int64, device=device)
         self.graph_seqlens = self.seq_table[0].clone() if max_len > 1 else None
-
-    def bind_rope(self, rope: dict[str, tuple[Tensor, Tensor]]) -> None:
-        """Materialize stable dual-lane RoPE buffers once per shape bucket."""
-        max_len = self.k.shape[2]
-
-        def interleave(x: Tensor) -> Tensor:
-            pair = torch.stack([x[:, 1:max_len], x[:, : max_len - 1]], dim=1)
-            return pair.expand(self.B, -1, -1, -1).reshape(2 * self.B, max_len - 1, -1)
-
-        self.rope_dual = {
-            lt: (interleave(c), interleave(s)) for lt, (c, s) in rope.items()
-        }
 
     def bind_alpha(self, cfg: WireConfig) -> None:
         values = [cfg.alpha_at(t) for t in range(self.k.shape[2])]
@@ -391,30 +395,51 @@ class RecirculationEngine:
         self._logits_chunk_c = torch.compile(self._logits_chunk, **compile_kw)
         self._nll_from_logits_c = torch.compile(self._nll_from_logits, **compile_kw)
 
+    @staticmethod
+    def _pack_parameter_family(parameters) -> Tensor:
+        """Pack along output rows and make each Parameter a disjoint view."""
+        packed = torch.cat([p.detach() for p in parameters], dim=0).contiguous()
+        for parameter, view in zip(
+            parameters, packed.split([p.shape[0] for p in parameters], dim=0)
+        ):
+            parameter.data = view
+        return packed
+
     def _build_packed_weights(self) -> None:
-        """Pack frozen projection families once; original model weights stay untouched."""
+        """Pack frozen projections and retire their duplicate original storage."""
         qkv_weights, qkv_biases, gate_up_weights = [], [], []
+        aliased_parameters = []
         for layer in self.layers:
             attn = layer.self_attn
-            qkv_weights.append(
-                torch.cat(
-                    [attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight], dim=0
-                )
-                .contiguous()
-                .detach()
-            )
+            weights = (attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight)
+            qkv_weights.append(self._pack_parameter_family(weights))
+            aliased_parameters.extend(weights)
             biases = (attn.q_proj.bias, attn.k_proj.bias, attn.v_proj.bias)
-            qkv_biases.append(
-                torch.cat(biases, dim=0).contiguous() if biases[0] is not None else None
-            )
-            gate_up_weights.append(
-                torch.cat([layer.mlp.gate_proj.weight, layer.mlp.up_proj.weight], dim=0)
-                .contiguous()
-                .detach()
-            )
+            if any(bias is None for bias in biases):
+                if not all(bias is None for bias in biases):
+                    raise ValueError("Q/K/V projections must agree on bias presence")
+                qkv_biases.append(None)
+            else:
+                qkv_biases.append(self._pack_parameter_family(biases))
+                aliased_parameters.extend(biases)
+            gate_up = (layer.mlp.gate_proj.weight, layer.mlp.up_proj.weight)
+            gate_up_weights.append(self._pack_parameter_family(gate_up))
+            aliased_parameters.extend(gate_up)
         self._qkv_weights = tuple(qkv_weights)
         self._qkv_biases = tuple(qkv_biases)
         self._gate_up_weights = tuple(gate_up_weights)
+
+        # Safetensors rejects shared backing storage even when views are
+        # disjoint. Clone only while producing a state_dict; the live model
+        # keeps the packed aliases, and load_state_dict writes through them.
+        parameter_names = {id(p): name for name, p in self.model.named_parameters()}
+        keys = {parameter_names[id(p)] for p in aliased_parameters}
+        if not hasattr(self.model, "_wire_packed_state_dict_keys"):
+            self.model._wire_packed_state_dict_keys = set()
+            self.model._wire_packed_state_dict_hook = (
+                self.model.register_state_dict_post_hook(_clone_packed_state_dict_views)
+            )
+        self.model._wire_packed_state_dict_keys.update(keys)
 
     def _ensure_rope(
         self, dtype: torch.dtype, device: torch.device
@@ -475,7 +500,24 @@ class RecirculationEngine:
         v = v.view(*input_shape, self.kv_heads, self.head_dim).transpose(1, 2)
         q = attn.q_norm(q)
         k = attn.k_norm(k)
-        q, k = apply_rotary_pos_emb(q, k, *pe)
+        if cache is not None and cache.rows != cache.B:
+            # pe holds only [current, previous]. Reshape the interleaved
+            # branch batch so those two rows broadcast over every example;
+            # Inductor fuses the gather/broadcast with rotary pointwise work.
+            cos, sin = pe
+            q = q.reshape(cache.B, 2, *q.shape[1:])
+            k = k.reshape(cache.B, 2, *k.shape[1:])
+            cos = cos.reshape(1, 2, 1, 1, self.head_dim)
+            sin = sin.reshape(1, 2, 1, 1, self.head_dim)
+
+            def rotate_half(z: Tensor) -> Tensor:
+                left, right = z.chunk(2, dim=-1)
+                return torch.cat((-right, left), dim=-1)
+
+            q = (q * cos + rotate_half(q) * sin).flatten(0, 1)
+            k = (k * cos + rotate_half(k) * sin).flatten(0, 1)
+        else:
+            q, k = apply_rotary_pos_emb(q, k, *pe)
 
         if cache is None:
             a = _fa2_prefill_op(
@@ -532,11 +574,25 @@ class RecirculationEngine:
                 h_s = x[: cache.B] if cache.rows == cache.B else x[0::2]
         return x, h_s
 
-    def _step(self, h_t: Tensor, h_prev: Tensor, h_s_prev: Tensor, alpha, beta, *rope):
+    def _step(
+        self,
+        h_t: Tensor,
+        h_prev: Tensor,
+        h_s_prev: Tensor,
+        alpha,
+        beta,
+        position: Tensor,
+        previous: Tensor,
+        *rope,
+    ):
         x = torch.stack([h_t, self.mix(h_s_prev, h_prev, alpha, beta)], dim=1).flatten(
             0, 1
         )
-        return self._slab(x, *rope)
+        positions = torch.cat((position, previous))
+        selected_rope = tuple(
+            table.index_select(1, positions).squeeze(0) for table in rope
+        )
+        return self._slab(x, *selected_rope)
 
     def _logits_chunk(self, h: Tensor) -> Tensor:
         lg = self.lm_head(self.final_norm(h))
@@ -570,8 +626,9 @@ class RecirculationEngine:
         # state while compiling, which CUDA correctly forbids mid-capture.
         t = cache.graph_t
         prev = cache.graph_prev
-        cf, sf = cache.rope_dual["full_attention"]
-        cs, ss = cache.rope_dual["sliding_attention"]
+        rope = self._ensure_rope(cache.k.dtype, cache.k.device)
+        cf, sf = rope["full_attention"]
+        cs, ss = rope["sliding_attention"]
         cache.h_s_state.zero_()
         self._step_c(
             cache.h_dest.index_select(1, t),
@@ -579,10 +636,12 @@ class RecirculationEngine:
             cache.h_s_state,
             cache.alpha.index_select(0, prev),
             cache.beta.index_select(0, prev),
-            cf.index_select(1, prev),
-            sf.index_select(1, prev),
-            cs.index_select(1, prev),
-            ss.index_select(1, prev),
+            t,
+            prev,
+            cf,
+            sf,
+            cs,
+            ss,
         )
         graph = torch.cuda.CUDAGraph()
         capture_stream = torch.cuda.Stream(device=cache.k.device)
@@ -596,18 +655,18 @@ class RecirculationEngine:
             prev = cache.graph_prev
             h_t = cache.h_dest.index_select(1, t)
             h_prev = cache.h_dest.index_select(1, prev)
-            cf, sf = cache.rope_dual["full_attention"]
-            cs, ss = cache.rope_dual["sliding_attention"]
             x, h_s = self._step_c(
                 h_t,
                 h_prev,
                 cache.h_s_state,
                 cache.alpha.index_select(0, prev),
                 cache.beta.index_select(0, prev),
-                cf.index_select(1, prev),
-                sf.index_select(1, prev),
-                cs.index_select(1, prev),
-                ss.index_select(1, prev),
+                t,
+                prev,
+                cf,
+                sf,
+                cs,
+                ss,
             )
             cache.tops.index_copy_(1, t, x[0::2])
             cache.h_s_state.copy_(h_s)
@@ -641,7 +700,6 @@ class RecirculationEngine:
                 dtype,
                 device,
             )
-            self._cache.bind_rope(self._ensure_rope(dtype, torch.device(device)))
             self._cache.bind_alpha(self.cfg)
             self._steady_graph = None
         return self._cache
@@ -672,21 +730,29 @@ class RecirculationEngine:
         cf, sf = rope["full_attention"]
         cs, ss = rope["sliding_attention"]
 
-        # Pass A: layers 0..dest for all columns in parallel (exact: the
-        # refresh never touches these layers, so nothing here ever sees
-        # recirculated state). No cache — slab KVs are never read later.
-        h_dest_out = self._prefill_c(
-            input_ids, cf[:, :T], sf[:, :T], cs[:, :T], ss[:, :T]
-        )
-
-        # Serial slab: layers dest+1..top, batched dual pass. Slicing
-        # rope_dual at [t-1 : t] yields (position t for the first half,
-        # position t-1 for the second).
+        # Allocate the shape bucket before pass A, then run one fixed B=64
+        # compiled prefill signature. Padding only the final chunk avoids
+        # batch-tail recompiles; its duplicate rows are discarded. Each
+        # result is copied immediately into the destination-state cache, so
+        # no full-batch pass-A output remains live at the prefill peak.
         cache = self._ensure_cache(B, T, dtype, device)
-        cache.h_dest[:, :T].copy_(h_dest_out)
         h_dest = cache.h_dest[:, :T]
+        for start in range(0, B, _PREFILL_BATCH):
+            valid = min(_PREFILL_BATCH, B - start)
+            ids = input_ids[start : start + valid]
+            if valid < _PREFILL_BATCH:
+                ids = torch.cat(
+                    (ids, ids[-1:].expand(_PREFILL_BATCH - valid, -1)), dim=0
+                )
+            prefill = self._prefill_c(
+                ids, cf[:, :T], sf[:, :T], cs[:, :T], ss[:, :T]
+            )
+            h_dest[start : start + valid].copy_(prefill[:valid])
+
+        # Serial slab: layers dest+1..top, batched dual pass. The compiled
+        # recurrent step gathers [position t, position t-1] from the compact
+        # RoPE tables and broadcasts that pair across interleaved branches.
         tops = cache.tops[:, :T]
-        rope_dual = cache.rope_dual
         h_s_prev: Tensor | None = None
         cache.step(0)
         x, h_s = self._slab_first_c(
@@ -728,17 +794,17 @@ class RecirculationEngine:
                         else torch.tensor(q, dtype=dtype, device=device)
                         for q in ab
                     )
-                cf, sf = rope_dual["full_attention"]
-                cs, ss = rope_dual["sliding_attention"]
                 x, h_s = self._step_c(
                     h_dest[:, t : t + 1],
                     h_dest[:, t - 1 : t],
                     h_s_prev,
                     *ab,
-                    cf[:, t - 1 : t],
-                    sf[:, t - 1 : t],
-                    cs[:, t - 1 : t],
-                    ss[:, t - 1 : t],
+                    cache.index_table[t : t + 1],
+                    cache.index_table[t - 1 : t],
+                    cf,
+                    sf,
+                    cs,
+                    ss,
                 )
                 tops[:, t : t + 1] = x[0::2]
                 h_s_prev = h_s

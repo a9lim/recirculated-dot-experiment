@@ -132,7 +132,7 @@ def main() -> None:
     p.add_argument("--windows", type=int, default=100)
     p.add_argument("--window-len", type=int, default=512)
     p.add_argument("--per-doc", type=int, default=2)
-    p.add_argument("--batch", type=int, default=128)
+    p.add_argument("--batch", type=int, default=512)
     p.add_argument(
         "--pairs",
         default=None,
