@@ -311,6 +311,12 @@ class BranchCache:
         self.cache_batch_idx = torch.arange(
             batch, dtype=torch.int32, device=device
         ).repeat_interleave(2)
+        prefill_rows = ((batch + _PREFILL_BATCH - 1) // _PREFILL_BATCH) * _PREFILL_BATCH
+        self.prefill_rows = (
+            torch.arange(prefill_rows, dtype=torch.int64, device=device)
+            .clamp_max(batch - 1)
+            .view(-1, _PREFILL_BATCH)
+        )
         self.seqlens = self.seq_table[0]
         self.write_index = self.index_table[:1]
         self.rows = batch
@@ -737,13 +743,12 @@ class RecirculationEngine:
         # no full-batch pass-A output remains live at the prefill peak.
         cache = self._ensure_cache(B, T, dtype, device)
         h_dest = cache.h_dest[:, :T]
-        for start in range(0, B, _PREFILL_BATCH):
+        for chunk_index, start in enumerate(range(0, B, _PREFILL_BATCH)):
             valid = min(_PREFILL_BATCH, B - start)
-            ids = input_ids[start : start + valid]
-            if valid < _PREFILL_BATCH:
-                ids = torch.cat(
-                    (ids, ids[-1:].expand(_PREFILL_BATCH - valid, -1)), dim=0
-                )
+            # index_select gives full and padded chunks the same dispatch
+            # keys and layout, so Dynamo retains one prefill graph even
+            # when B is not divisible by 64.
+            ids = input_ids.index_select(0, cache.prefill_rows[chunk_index])
             prefill = self._prefill_c(
                 ids, cf[:, :T], sf[:, :T], cs[:, :T], ss[:, :T]
             )
