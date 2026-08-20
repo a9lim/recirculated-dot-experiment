@@ -223,6 +223,30 @@ norm-linear algebra, concurrent readout, quantization, and device
 parallelism are not part of the canonical path: the first three failed
 the end-to-end speed gate; the latter two were explicitly out of scope.
 
+**D11 — task serialization and forced-choice eval.** (2026-08-20)
+Sequences are composed in id space and never re-tokenized:
+`[BOS] prompt-ids | think-span → answer`, think span = k×`<unused0>`
+(D8), the `render_cot` trace, or empty; the answer token is never part
+of the eval input — the final think/prompt position predicts it.
+Task knobs are pinned so every rendered surface form is a single
+Gemma3 token (reachability runs `nodes=10`; `"10"`/`"11"` split into
+digit pairs). Two consequences, both load-bearing: (i) every
+wire-facing condition has exactly ONE token length per (task, k), so
+the compiled wire keeps one execution shape per cell (measured: s5 105,
+parity 68, reachability 82, threesum 53, +k); (ii) a CoT trace costs
+exactly one token per serial state — the legible topline is
+budget-matched against k dots. Eval is forced-choice over the task's
+label tokens (chance = 1/|labels|), read from the engine's
+`answer_logits` (single-position readout — the same answer-only shape
+D9 pins for training supervision); soft-everywhere, full-vocab
+legality and gold logprob ride along. Wire-off arms run the plain
+flipped-model forward (identical FA2 kernels, D10 addendum),
+length-bucketed for the one ragged case (reachability CoT). Instance
+sets are sampled once per task and shared across all conditions —
+comparisons are paired. Conditions: {none, wire, dots, dots+wire} + a
+`cot` topline; k sweeps the dots conditions only (D4: v0 fixed-k
+teacher-forced; the k-sweep is the money plot).
+
 ## Open
 
 - Reachability negatives are unconstrained; if shortcut heuristics
