@@ -135,3 +135,22 @@ sdpa fp32 path). Journey: 73 → 38 → 5 → **3 s (24×)**. Defaults:
 sdpa; the Mac falls back cleanly), compile opt-in via `--compile`.
 The custom op and stacked-lane design carry over to the training
 path (D9).
+
+## Canonicalization (2026-08-20, D10)
+
+Compiled-FA2 ratified as the only path; sdpa dual-pass, mask
+machinery, and all flags stripped (git history keeps them). Repro on
+the canonical path: PG19 −8.81%, C4 −5.11%, 5 s/3 s per 100×512
+windows (first dataset amortizes compile).
+
+The fp32 identity gate retired with the sdpa path (FA2 is
+half-precision-only). Rather than guessing a bf16 tolerance, G0 now
+calibrates against a measured **null**: the plain HF forward compared
+with *itself* under a kernel-tiling change (batch-4 vs row-by-row)
+disagrees at mean |Δlogit| 5.45e-2, top-1 0.9648 — and the α=0 engine
+vs the plain forward sits *inside* that null (5.26e-2, 0.9824, ppl
+rel 7e-4). The wire adds zero divergence beyond intrinsic bf16
+kernel-order noise; thresholds (mean < 0.15, top-1 > 0.95, ppl rel
+< 2e-3) live in the ~20× gap between the null and machinery-bug
+scale. Method worth keeping: when a gate loses its exact reference,
+measure the self-noise null before pinning tolerances.

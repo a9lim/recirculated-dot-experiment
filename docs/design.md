@@ -142,6 +142,21 @@ inference wire (broadcast materialization, non-re-inplaced mutations;
 findings 2026-08-20 round 2) do not apply. Keep the `_wire_sdpa`
 stride-0 GQA expansion in the training attention path too.
 
+**D10 — canonical wire: one path.** (2026-08-20, a9 ratified) The
+compiled-FA2 configuration is not the default but the *only* path:
+CUDA, half precision, FlashAttention kvcache for the dual pass,
+torch.compile(fullgraph) over the serial slab. The sdpa dual-pass
+implementation, mask machinery, and backend/compile flags are
+stripped (git history keeps them; findings keeps the measurements).
+Rationale: training and eval share one set of numerics — no mid-run
+surprises from a path switch — and the Mac is not a target. Cost
+knowingly accepted: the fp32 identity gate retired with the sdpa
+path; G0's identity now runs bf16 with thresholds calibrated against
+the measured null (plain HF forward vs itself under a kernel-tiling
+change) — the engine at α=0 sits *inside* that null (mean |Δlogit|
+5.3e-2 vs 5.5e-2; top-1 0.982 vs 0.965; ppl rel 7e-4). The last fp32
+proof of the same algorithm: max |Δlogit| 1.2e-4 (2026-08-20).
+
 ## Open
 
 - Reachability negatives are unconstrained; if shortcut heuristics

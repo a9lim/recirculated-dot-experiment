@@ -2,8 +2,11 @@
 
   identity  alpha=0 two-pass run must match the plain HF forward
             (second passes recompute identical activations, so the KV
-            overwrite is a no-op; run in fp32, tolerance covers serial-
-            vs-parallel op-order differences only).
+            overwrite is a no-op). Runs in bf16 on the canonical
+            compiled-FA2 path (D10); thresholds are pinned from the
+            measured serial-vs-parallel bf16 noise floor — machinery
+            bugs produce O(1) divergence, not noise. The retired fp32
+            sdpa reference passed at max |dlogit| 1.2e-4 on 2026-08-20.
   repro     untrained perplexity reduction on text windows, paper pair
             {11,4} at alpha=0.15 — expect order 10% on PG19, ~4% on C4.
             --pairs adds controls (e.g. adjacent bad pair 8,7 -> ~none).
@@ -28,12 +31,12 @@ DATASETS = {
 }
 
 
-def load_model(name: str, device: str, dtype: torch.dtype):
+def load_model(name: str, device: str):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(name)
     model = AutoModelForCausalLM.from_pretrained(
-        name, dtype=dtype, attn_implementation="sdpa"
+        name, dtype=torch.bfloat16, attn_implementation="sdpa"
     )
     model.to(device).eval()
     return tok, model
@@ -86,8 +89,6 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("mode", choices=["identity", "repro"])
     p.add_argument("--model", default="google/gemma-3-1b-pt")
-    p.add_argument("--device", default=None)
-    p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"])
     p.add_argument("--source", type=int, default=11)
     p.add_argument("--dest", type=int, default=4)
     p.add_argument("--alpha", type=float, default=0.15)
@@ -102,48 +103,41 @@ def main() -> None:
         default=None,
         help="extra source,dest pairs to run as controls, e.g. '8,7;12,4'",
     )
-    p.add_argument(
-        "--compile",
-        nargs="?",
-        const="default",
-        default=None,
-        help="torch.compile the slab step ('default' or 'reduce-overhead')",
-    )
-    p.add_argument(
-        "--backend",
-        default="auto",
-        choices=["auto", "sdpa", "fa2"],
-        help="attention backend (identity mode always uses sdpa: fp32)",
-    )
     args = p.parse_args()
 
-    device = args.device or (
-        "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    )
+    device = "cuda"  # canonical wire is CUDA-only (D10)
     if args.mode == "identity":
-        args.dtype, args.windows, args.per_doc = "float32", 4, 1
+        args.windows, args.per_doc = 4, 1
         args.window_len = min(args.window_len, 128)
-    dtype = getattr(torch, args.dtype)
-    tok, model = load_model(args.model, device, dtype)
-    print(f"{args.model} on {device} ({args.dtype})")
+    tok, model = load_model(args.model, device)
+    print(f"{args.model} on {device} (bfloat16)")
 
     if args.mode == "identity":
         windows = collect_windows("pg19", tok, args.windows, args.window_len, 1)
         ids = torch.tensor(windows, device=device)
         base = model(ids).logits.float()
         engine = RecirculationEngine(
-            model,
-            WireConfig(args.source, args.dest, alpha=0.0, ramp_steps=0),
-            compile_mode=args.compile,
-            attn_backend="sdpa",
+            model, WireConfig(args.source, args.dest, alpha=0.0, ramp_steps=0)
         )
         ours = engine.teacher_forced_logits(ids).float()
         diff = (ours - base).abs()
+        top1 = (ours.argmax(-1) == base.argmax(-1)).float().mean().item()
         base_ppl = float(torch.exp(torch.tensor(nll_sum(base, ids)[0] / nll_sum(base, ids)[1])))
         ours_ppl = float(torch.exp(torch.tensor(nll_sum(ours, ids)[0] / nll_sum(ours, ids)[1])))
-        print(f"max|dlogit| {diff.max():.2e}  mean|dlogit| {diff.mean():.2e}")
+        print(f"max|dlogit| {diff.max():.2e}  mean|dlogit| {diff.mean():.2e}  top1 {top1:.4f}")
         print(f"ppl plain {base_ppl:.4f}  engine(alpha=0) {ours_ppl:.4f}")
-        ok = diff.max().item() < 1e-3
+        # Thresholds calibrated against the measured bf16 null: the plain
+        # HF forward vs ITSELF under a kernel-tiling change (batch-4 vs
+        # row-by-row) gives mean|dlogit| 5.5e-2, top1 0.965 — and the
+        # engine sits INSIDE that null (5.3e-2, 0.982; ppl rel 7e-4).
+        # Machinery bugs (e.g. a wrong KV slot) sit a factor ~20 above in
+        # mean and scramble top1; thresholds live in the gap. The retired
+        # fp32 sdpa reference proved the same algorithm exact (1.2e-4).
+        ok = (
+            diff.mean().item() < 0.15
+            and abs(ours_ppl - base_ppl) / base_ppl < 2e-3
+            and top1 > 0.95
+        )
         print("IDENTITY", "PASS" if ok else "FAIL")
         raise SystemExit(0 if ok else 1)
 
@@ -161,10 +155,7 @@ def main() -> None:
         print(f"  baseline           ppl {base:8.3f}          ({time.time() - t0:.0f}s)")
         for s, d in pairs:
             engine = RecirculationEngine(
-                model,
-                WireConfig(s, d, alpha=args.alpha, ramp_steps=args.ramp),
-                compile_mode=args.compile,
-                attn_backend=args.backend,
+                model, WireConfig(s, d, alpha=args.alpha, ramp_steps=args.ramp)
             )
             def engine_nll(ids, engine=engine):
                 nll, _ = engine.teacher_forced(ids)
