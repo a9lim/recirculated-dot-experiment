@@ -109,6 +109,12 @@ def main() -> None:
         default=None,
         help="torch.compile the slab step ('default' or 'reduce-overhead')",
     )
+    p.add_argument(
+        "--backend",
+        default="auto",
+        choices=["auto", "sdpa", "fa2"],
+        help="attention backend (identity mode always uses sdpa: fp32)",
+    )
     args = p.parse_args()
 
     device = args.device or (
@@ -129,6 +135,7 @@ def main() -> None:
             model,
             WireConfig(args.source, args.dest, alpha=0.0, ramp_steps=0),
             compile_mode=args.compile,
+            attn_backend="sdpa",
         )
         ours = engine.teacher_forced_logits(ids).float()
         diff = (ours - base).abs()
@@ -157,6 +164,7 @@ def main() -> None:
                 model,
                 WireConfig(s, d, alpha=args.alpha, ramp_steps=args.ramp),
                 compile_mode=args.compile,
+                attn_backend=args.backend,
             )
             def engine_nll(ids, engine=engine):
                 nll, _ = engine.teacher_forced(ids)

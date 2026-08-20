@@ -69,16 +69,61 @@ from torch import Tensor
 from transformers import AttentionInterface
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
 
+try:
+    from flash_attn import flash_attn_with_kvcache as _fa2_kvcache
+except ImportError:  # e.g. the Mac; fa2 backend then refuses at construction
+    _fa2_kvcache = None
+
+if _fa2_kvcache is not None:
+    # flash_attn 2.8 exposes fwd_kvcache as a raw C extension (PyCapsule),
+    # which dynamo cannot trace; wrapping it as a torch custom op with the
+    # cache mutations declared makes it an opaque-but-graphable extern.
+    @torch.library.custom_op("wire::fa2_kvcache", mutates_args=("k_cache", "v_cache"))
+    def _fa2_op(
+        q: Tensor,
+        k_cache: Tensor,
+        v_cache: Tensor,
+        k_new: Tensor,
+        v_new: Tensor,
+        cache_seqlens: Tensor,
+        scale: float,
+    ) -> Tensor:
+        return _fa2_kvcache(
+            q, k_cache, v_cache, k=k_new, v=v_new, cache_seqlens=cache_seqlens, softmax_scale=scale
+        )
+
+    @_fa2_op.register_fake
+    def _(q, k_cache, v_cache, k_new, v_new, cache_seqlens, scale):
+        return torch.empty_like(q)
+
 
 def _wire_sdpa(module, query, key, value, attention_mask, **kwargs):
-    """sdpa with zero-copy GQA under masks. HF's stock sdpa path repeat_kv's
-    K/V to all query heads whenever a mask is present — a materialized copy
-    plus 4x attention traffic at Gemma3's 4:1 head ratio, and the dual-pass
-    attention is memory-bound. Stride-0 expand views hit the same fused
-    kernel with 1-head traffic (measured 464 -> 119 us at q_len=1, kv=512,
-    B=200; bitwise-identical output). enable_gqa is NOT the answer: with a
-    dense mask it falls back to the math backend (3354 us). Maskless calls
-    (pass A, t=0) defer to stock."""
+    """The wire's attention: three dispatch tiers.
+
+    1. `wire_cache` kwarg present (fa2 backend, dual/single step): the
+       FlashAttention kvcache kernel — per-lane cache_seqlens express the
+       dual-pass visibility (both lanes are prefix reads), the slot write
+       happens in-kernel, GQA is native, and no mask tensor exists at all
+       (measured 43 vs 119 us against masked sdpa at kv=512, 200 rows).
+       bf16/fp16 only.
+    2. mask present (sdpa backend, dual/single step): sdpa with stride-0
+       expand views for GQA — HF's stock path would repeat_kv (a copy +
+       4x traffic; 464 us), and enable_gqa=True with a dense mask falls
+       back to the math backend (3354 us). Expand views hit the fused
+       kernel at 1-head traffic (119 us, bitwise-identical).
+    3. maskless (pass A): stock sdpa (is_causal synthesis for q_len > 1).
+    """
+    cache = kwargs.get("wire_cache")
+    if cache is not None:
+        out = _fa2_op(
+            query.transpose(1, 2),
+            *cache.views(module.layer_idx),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            cache.seqlens,
+            kwargs.get("scaling"),
+        )
+        return out, None
     if attention_mask is None:
         return sdpa_attention_forward(module, query, key, value, None, **kwargs)
     if module.num_key_value_groups > 1 and key.shape[1] == 1:
@@ -173,14 +218,80 @@ class DualCache:
         self.v[layer_idx][: self.B].index_copy_(2, self.tm1_idx, v2)
 
 
+class DualCacheFA2:
+    """Stacked FA2-layout ([rows, seq, kv_heads, head_dim]) KV lanes for
+    the serial slab. The kvcache kernel does the slot writes in-kernel
+    from cache_seqlens (lane 0 appends first-pass at slot t; lane 1
+    overwrites its recompute at t-1), so `update` just forwards the
+    new-token KV to the attention interface. Lane 0's refresh commits as
+    ONE fused lane1->lane0 copy across all layers at step end — next
+    reader of any lane is step t+1, so end-of-step commit preserves the
+    same-snapshot semantics exactly."""
+
+    dual = False  # engine-side per-layer commit is never used on this cache
+
+    def __init__(
+        self,
+        n_slab: int,
+        first_layer: int,
+        batch: int,
+        kv_heads: int,
+        max_len: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        device: torch.device | str,
+    ):
+        self.B = batch
+        self.first = first_layer
+        shape = (n_slab, 2 * batch, max_len, kv_heads, head_dim)
+        self.k = torch.zeros(shape, dtype=dtype, device=device)
+        self.v = torch.zeros(shape, dtype=dtype, device=device)
+        self.seq_base = torch.cat(
+            [
+                torch.zeros(batch, dtype=torch.int32, device=device),
+                torch.full((batch,), -1, dtype=torch.int32, device=device),
+            ]
+        )
+        self.seqlens = self.seq_base[: batch].clone()
+        self.rows = batch
+
+    def step(self, t: int) -> None:
+        if t == 0:
+            self.rows = self.B
+            self.seqlens = torch.zeros(self.B, dtype=torch.int32, device=self.k.device)
+        else:
+            self.rows = 2 * self.B
+            self.seqlens = self.seq_base + t
+
+    def views(self, layer_idx: int) -> tuple[Tensor, Tensor]:
+        j = layer_idx - self.first
+        return self.k[j, : self.rows], self.v[j, : self.rows]
+
+    def update(self, key_states: Tensor, value_states: Tensor, layer_idx: int, *a, **kw):
+        return key_states, value_states  # the fa2 kernel does the cache write
+
+    def commit(self, t: int) -> None:
+        self.k[:, : self.B, t - 1] = self.k[:, self.B :, t - 1]
+        self.v[:, : self.B, t - 1] = self.v[:, self.B :, t - 1]
+
+
 class RecirculationEngine:
     """Wraps a Gemma3ForCausalLM (weights untouched, model in eval mode).
 
     compile_mode: None (eager), "default", or "reduce-overhead" — passed
     to torch.compile for the slab step.
+    attn_backend: "sdpa" (masked, works in any dtype — the fp32 identity
+    gate requires it), "fa2" (FlashAttention kvcache; bf16/fp16 only), or
+    "auto" (fa2 when available and the model is half precision).
     """
 
-    def __init__(self, model, cfg: WireConfig, compile_mode: str | None = None):
+    def __init__(
+        self,
+        model,
+        cfg: WireConfig,
+        compile_mode: str | None = None,
+        attn_backend: str = "auto",
+    ):
         mc = model.config
         if not 0 <= cfg.dest < cfg.source < mc.num_hidden_layers:
             raise ValueError(f"need 0 <= dest < source < {mc.num_hidden_layers}")
@@ -204,7 +315,22 @@ class RecirculationEngine:
         self.head_dim = mc.head_dim
         self.window = mc.sliding_window
         self.softcap = getattr(mc, "final_logit_softcapping", None)  # None on Gemma3-1B
-        self._cache: DualCache | None = None
+        dtype = inner.embed_tokens.weight.dtype
+        if attn_backend == "auto":
+            attn_backend = (
+                "fa2"
+                if _fa2_kvcache is not None and dtype in (torch.bfloat16, torch.float16)
+                else "sdpa"
+            )
+        if attn_backend == "fa2":
+            if _fa2_kvcache is None:
+                raise ValueError("fa2 backend requires the flash-attn package")
+            if dtype not in (torch.bfloat16, torch.float16):
+                raise ValueError(f"fa2 backend is half-precision only, model is {dtype}")
+        elif attn_backend != "sdpa":
+            raise ValueError(f"unknown attn_backend {attn_backend!r}")
+        self.attn_backend = attn_backend
+        self._cache: DualCache | DualCacheFA2 | None = None
         self._mask: Tensor | None = None
         self._slab_c = None
         if compile_mode is not None:
@@ -221,21 +347,44 @@ class RecirculationEngine:
         eager and compiled paths."""
         cache = self._cache
         B = cache.B
+        wire = cache if isinstance(cache, DualCacheFA2) else None
         h_s = x[:B]
         for i in range(self.cfg.dest + 1, self.n_layers):
             pe = (cos_f, sin_f) if self.layer_types[i] == "full_attention" else (cos_s, sin_s)
             x = self.layers[i](
-                x, position_embeddings=pe, attention_mask=mask, past_key_values=cache
+                x,
+                position_embeddings=pe,
+                attention_mask=mask,
+                past_key_values=cache,
+                wire_cache=wire,
             )
             if i == self.cfg.source:
                 h_s = x[:B]
-            if cache.dual:
+            if cache.dual:  # sdpa path: per-layer commit; fa2 commits at step end
                 cache.commit(i)
         return x, h_s
 
-    def _ensure_buffers(self, B: int, T: int, dtype, device) -> tuple[DualCache, Tensor]:
+    def _ensure_buffers(self, B: int, T: int, dtype, device):
         c = self._cache
-        if c is None or c.B != B or c.shape[2] < T or c.dtype != dtype:
+        if self.attn_backend == "fa2":
+            if (
+                not isinstance(c, DualCacheFA2)
+                or c.B != B
+                or c.k.shape[2] < T
+                or c.k.dtype != dtype
+            ):
+                self._cache = DualCacheFA2(
+                    self.n_layers - self.cfg.dest - 1,
+                    self.cfg.dest + 1,
+                    B,
+                    self.kv_heads,
+                    T,
+                    self.head_dim,
+                    dtype,
+                    device,
+                )
+            return self._cache, None
+        if not isinstance(c, DualCache) or c.B != B or c.shape[2] < T or c.dtype != dtype:
             self._cache = DualCache(B, self.kv_heads, T, self.head_dim, dtype, device)
             self._mask = torch.empty(2 * B, 1, 1, T, dtype=dtype, device=device)
         elif self._mask.shape[-1] < T:
@@ -279,11 +428,13 @@ class RecirculationEngine:
         # rope_dual at [t-1 : t] yields (position t for the first half,
         # position t-1 for the second).
         cache, mask_buf = self._ensure_buffers(B, T, dtype, device)
+        fa2 = self.attn_backend == "fa2"
         compiled = self._slab_c is not None and T > 1
-        cache.static = compiled
-        neg = torch.finfo(dtype).min
-        mask_buf.fill_(neg)
-        idxs = torch.arange(T, device=device)
+        if not fa2:
+            cache.static = compiled
+            neg = torch.finfo(dtype).min
+            mask_buf.fill_(neg)
+            idxs = torch.arange(T, device=device)
         tops = torch.empty(B, T, h.shape[-1], dtype=dtype, device=device)
         rope_dual = (
             {
@@ -298,14 +449,18 @@ class RecirculationEngine:
         )
         h_s_prev: Tensor | None = None
         for t in range(T):
+            if fa2:
+                cache.step(t)
             if t == 0:
-                cache.t, cache.dual = 0, False
+                if not fa2:
+                    cache.t, cache.dual = 0, False
                 cf, sf = rope["full_attention"]
                 cs, ss = rope["sliding_attention"]
                 x, h_s = self._slab(
                     h_dest[:, :1], None, cf[:, :1], sf[:, :1], cs[:, :1], ss[:, :1]
                 )
-                mask_buf[:B, ..., 0] = 0.0
+                if not fa2:
+                    mask_buf[:B, ..., 0] = 0.0
             else:
                 if alpha_fn is None:
                     a = cfg.alpha_at(t - 1)
@@ -313,17 +468,23 @@ class RecirculationEngine:
                 else:
                     ab = alpha_fn(t - 1, h_s_prev, h_dest[:, t - 1 : t])
                 x = torch.cat([h_dest[:, t : t + 1], self.mix(h_s_prev, h_dest[:, t - 1 : t], *ab)])
-                cache.t, cache.dual = t, True
-                cache.t_idx, cache.tm1_idx = idxs[t : t + 1], idxs[t - 1 : t]
-                mask_buf[:B, ..., t] = 0.0  # lane 0 gains its own slot t
-                mask_buf[B:, ..., t - 1] = 0.0  # lane 1 gains its recomputed t-1
+                if fa2:
+                    mask = None
+                else:
+                    cache.t, cache.dual = t, True
+                    cache.t_idx, cache.tm1_idx = idxs[t : t + 1], idxs[t - 1 : t]
+                    mask_buf[:B, ..., t] = 0.0  # lane 0 gains its own slot t
+                    mask_buf[B:, ..., t - 1] = 0.0  # lane 1 gains its recomputed t-1
+                    mask = mask_buf if compiled else mask_buf[..., : t + 1]
                 cf, sf = rope_dual["full_attention"]
                 cs, ss = rope_dual["sliding_attention"]
                 pe4 = (cf[:, t - 1 : t], sf[:, t - 1 : t], cs[:, t - 1 : t], ss[:, t - 1 : t])
                 if compiled:
-                    x, h_s = self._slab_c(x, mask_buf, *pe4)
+                    x, h_s = self._slab_c(x, mask, *pe4)
                 else:
-                    x, h_s = self._slab(x, mask_buf[..., : t + 1], *pe4)
+                    x, h_s = self._slab(x, mask, *pe4)
+                if fa2:
+                    cache.commit(t)
             tops[:, t : t + 1] = x[:B]
             h_s_prev = h_s
 

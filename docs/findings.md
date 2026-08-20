@@ -103,3 +103,35 @@ alone floors the slab near ~2 ms/step, so remaining headroom is ≤2×
 at high effort/risk. Final canonical numbers: PG19 −8.75%, C4 −5.11%,
 5 s per 100×512 windows each, identity gate exact. Journey: 73 → 5 s
 (14.6×), semantics-preserving at every step.
+
+## Round 3: FA2 kvcache × compile (2026-08-20, a9's call)
+
+Round 2's "FA2 cannot express the dual-pass mask" was true only of
+the HF integration path. Correction: the dual-pass "mask" is really
+*per-lane prefix lengths*, and `flash_attn_with_kvcache` expresses
+exactly that via per-row `cache_seqlens` — lane 0 appends first-pass
+at slot t, lane 1 overwrites its recompute at t-1, both in-kernel.
+Measured 43 vs 119 µs against the fixed masked sdpa (it only reads
+the live prefix; no mask tensor exists), output matching to bf16
+noise. The `fa2` backend (`DualCacheFA2`, stacked lanes, one fused
+lane1→lane0 commit per step at step end) rides HF's kwargs
+passthrough — still no layer forking.
+
+FA2 and compile then compose exactly as hoped — better than
+orthogonal: the kvcache interface removes both structures that made
+inductor lose in round 2 (no mask-driven broadcast to materialize;
+cache writes hidden inside an opaque op; the commit lives outside
+the graph). One wrinkle: flash-attn 2.8 exposes `fwd_kvcache` as a
+raw PyCapsule that dynamo cannot trace — wrapped as a torch custom
+op with `mutates_args=("k_cache","v_cache")` and a fake kernel, after
+which the slab compiles fullgraph. `reduce-overhead` adds nothing
+(cudagraphs decline the mutating custom op and fall back).
+
+**Landing: 3 s per 100×512 windows** at B=100 (~5.9 ms/step, at the
+estimated weight-traffic floor), ppl invariant across all backends ×
+compile combinations (21.001–21.016 PG19; identity gate exact on the
+sdpa fp32 path). Journey: 73 → 38 → 5 → **3 s (24×)**. Defaults:
+`attn_backend="auto"` (fa2 when available + half precision, else
+sdpa; the Mac falls back cleanly), compile opt-in via `--compile`.
+The custom op and stacked-lane design carry over to the training
+path (D9).
