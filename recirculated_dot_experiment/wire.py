@@ -114,12 +114,17 @@ def _merge_branch_tails(
     v0, v1 = v_new[0::2], v_new[1::2]
     score_prev = (q0 * side_k).sum(dim=-1) * scale
     score_new = (q0 * k0).sum(dim=-1) * scale
-    tail_scores0 = torch.stack([score_prev, score_new], dim=-1).float()
-    tail_weights0 = torch.softmax(tail_scores0, dim=-1)
-    tail_lse0 = torch.logsumexp(tail_scores0, dim=-1)
+    score_prev = score_prev.float()
+    score_new = score_new.float()
+    tail_maximum0 = torch.maximum(score_prev, score_new)
+    prev_weight = torch.exp(score_prev - tail_maximum0)
+    new_weight = torch.exp(score_new - tail_maximum0)
+    tail_denom0 = prev_weight + new_weight
+    tail_lse0 = tail_maximum0 + torch.log(tail_denom0)
     tail_out0 = (
-        tail_weights0[..., :1] * side_v.float() + tail_weights0[..., 1:] * v0.float()
-    )
+        prev_weight.unsqueeze(-1) * side_v.float()
+        + new_weight.unsqueeze(-1) * v0.float()
+    ) / tail_denom0.unsqueeze(-1)
     tail_lse1 = ((q1 * k1).sum(dim=-1) * scale).float()
     tail_out1 = v1.expand(-1, -1, q.shape[2], -1).float()
     tail = torch.stack([tail_out0, tail_out1], dim=1).reshape_as(prefix)
