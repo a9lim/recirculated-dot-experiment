@@ -297,7 +297,16 @@ class BranchCache:
         self.seqlens = self.seq_table[0]
         self.write_index = self.index_table[:1]
         self.rows = batch
-        self.tops = torch.empty(batch, max_len, hidden_size, dtype=dtype, device=device)
+        # At most one readout chunk of padding makes every LM-head/NLL call
+        # the same shape, avoiding a separate final-chunk compilation.
+        readout_chunk = max(1, 1024 // batch)
+        top_capacity = max_len + readout_chunk - 1
+        self.tops = torch.empty(
+            batch, top_capacity, hidden_size, dtype=dtype, device=device
+        )
+        self.readout_targets = torch.empty(
+            batch, top_capacity, dtype=torch.int64, device=device
+        )
         self.rope_dual: dict[str, tuple[Tensor, Tensor]] = {}
         self.alpha: Tensor | None = None
         self.beta: Tensor | None = None
@@ -735,25 +744,38 @@ class RecirculationEngine:
                 h_s_prev = h_s
 
         # Deferred readout: chunked over positions to bound the fp32
-        # softmax footprint at Gemma3's 262k vocab. The NLL-only compiled
-        # path fuses log-softmax + target gather and never materializes the
-        # fp32 [tokens, vocab] tensor.
-        nlls, logits, chunk = [], [], max(1, 1024 // B)
+        # softmax footprint at Gemma3's 262k vocab. Scratch-padding the
+        # final chunk gives every compiled call one shape; padded results
+        # are discarded. The NLL-only graph fuses log-softmax + gather.
+        nlls, logits = [], []
+        work_len = T if return_logits else T - 1
+        if work_len == 0:
+            return torch.empty(B, 0, device=device), None
+        chunk = min(work_len, max(1, 1024 // B))
+        padded_len = ((work_len + chunk - 1) // chunk) * chunk
+        if padded_len > T:
+            cache.tops[:, T:padded_len] = cache.tops[:, T - 1 : T]
+        cache.readout_targets[:, : T - 1].copy_(input_ids[:, 1:T])
+        if padded_len > T - 1:
+            cache.readout_targets[:, T - 1 : padded_len] = input_ids[:, -1:]
+
         if return_logits:
-            for i in range(0, T, chunk):
-                lg = self._logits_chunk_c(tops[:, i : i + chunk])
+            for i in range(0, padded_len, chunk):
+                lg = self._logits_chunk_c(cache.tops[:, i : i + chunk])
                 logits.append(lg)
-                hi = min(i + chunk, T - 1)
-                if i < hi:
-                    targets = input_ids[:, i + 1 : hi + 1]
-                    nlls.append(self._nll_from_logits_c(lg[:, : hi - i], targets))
+                nlls.append(
+                    self._nll_from_logits_c(lg, cache.readout_targets[:, i : i + chunk])
+                )
         else:
-            for i in range(0, T - 1, chunk):
-                hi = min(i + chunk, T - 1)
-                targets = input_ids[:, i + 1 : hi + 1]
-                nlls.append(self._nll_chunk_c(tops[:, i:hi], targets))
-        nll = torch.cat(nlls, dim=1) if nlls else torch.empty(B, 0, device=device)
-        return nll, (torch.cat(logits, dim=1) if return_logits else None)
+            for i in range(0, padded_len, chunk):
+                nlls.append(
+                    self._nll_chunk_c(
+                        cache.tops[:, i : i + chunk],
+                        cache.readout_targets[:, i : i + chunk],
+                    )
+                )
+        nll = torch.cat(nlls, dim=1)[:, : T - 1]
+        return nll, (torch.cat(logits, dim=1)[:, :T] if return_logits else None)
 
     def teacher_forced_logits(self, input_ids: Tensor, alpha_fn=None) -> Tensor:
         """First-pass logits [B, T, V]; small T only (full-vocab memory)."""
