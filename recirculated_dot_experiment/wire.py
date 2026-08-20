@@ -92,6 +92,14 @@ from transformers.models.gemma3.modeling_gemma3 import apply_rotary_pos_emb
 
 _PREFILL_BATCH = 64
 
+# Per-shape specialization is the canon (D10): every distinct T compiles
+# its own graph, and a task grid (D11) legitimately visits dozens of
+# prompt+k lengths. Dynamo's default guardrail (8 recompiles per frame,
+# a hard abort under fullgraph) would kill such a grid mid-run; the
+# guard we actually rely on against *accidental* recompiles is G0's
+# unique-graph audit over timed evaluation.
+torch._dynamo.config.recompile_limit = 256
+
 
 def _clone_packed_state_dict_views(module, state_dict, prefix, local_metadata) -> None:
     """Give serializers independent tensors without retaining them at runtime."""
