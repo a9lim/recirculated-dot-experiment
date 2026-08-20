@@ -90,7 +90,6 @@ from torch.nn import functional as F
 from transformers import AttentionInterface, AttentionMaskInterface
 from transformers.models.gemma3.modeling_gemma3 import apply_rotary_pos_emb
 
-
 _PREFILL_BATCH = 64
 
 

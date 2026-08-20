@@ -268,3 +268,36 @@ alpha fallback all finite. The 100x512 reproduction remains PG19
 **-9.00%** and C4 **-5.09%**. The accepted identity shift is below the
 recalibrated G0 boundary and remains jointly constrained by all three
 metrics.
+
+## Memory and throughput scaling pass (2026-08-20)
+
+Four compatible changes now define the canonical memory layout and batch
+policy. Pass A runs in fixed B=64 chunks, including a row-index-padded
+final chunk with the same dispatch keys, and copies each output directly
+into pooled destination storage. The original projection Parameters are
+disjoint views of the packed QKV and gate/up tensors, retiring **0.857
+GiB** of duplicate storage while leaving plain-model logits bit-identical.
+A state-dict post-hook clones only those views during export; strict reload
+preserved the live aliases and full safetensors `save_pretrained` passed.
+
+The recurrent step no longer retains expanded dual-lane RoPE. It gathers
+only positions `[t,t-1]` from the compact tables inside the compiled graph
+and broadcasts them over branch lanes. The persistent RoPE footprint is
+**0.001 GiB**, replacing about 0.25 GiB at B=128 and 1.00 GiB at B=512.
+This is deliberately distinct from pushing RoPE into FA2 itself, whose
+earlier whole-wire timing failed.
+
+On the RTX 4090, the final B=128,T=512 path measured **2.350–2.351 s**
+(27.87–27.89k token/s), unchanged in speed from the prior path, while peak
+allocation fell from 8.20 to **5.35 GiB**. The new default B=512,T=512
+measured **8.008–8.019 s**, **32.69–32.74k token/s** (about 17% more
+throughput than B=128), at **10.15 GiB** peak. Both shapes use five unique
+compiled graphs and trigger zero graphs during timed replay; a nonmultiple
+B=100 reproduction also stays at five through the uniform prefill gather.
+
+Final gates: bf16 identity PASS (mean |dlogit| 5.80e-2, top-1 0.9746,
+plain/engine ppl 27.0229/27.0575); deterministic graph replay; T=1..4
+finite in bf16 and fp16; adaptive-alpha fallback finite; PG19 **-9.00%**
+and C4 **-5.09%** over 100x512 windows. Compilation/capture remained
+outside experiment timing, and both dataset evaluations took 2.13 s with
+zero recompiles.

@@ -177,11 +177,16 @@ tensor-heavy region that has a stable semantic boundary: packed-QKV /
 packed-gate-up pass A, the first slab step, recurrent mix+slab, and
 chunked readout. The outer position loop remains the authoritative
 Python state machine because it advances and commits the mutable dual
-cache; it performs no model math. Cache/RoPE/scratch state is pooled by
-shape. Default evaluation batch is 128. Rationale: one graph around an
-unrolled 512-step mutable loop is brittle and enormous; regional
-fullgraph compilation gets the fusion without obscuring the wire's
-snapshot/commit boundary.
+cache; it performs no model math. Pass A always uses one compiled B=64
+signature, padding only its final chunk and writing each result directly
+into pooled destination-state storage. The original Q/K/V and gate/up
+Parameters are disjoint views of their packed tensors; state-dict export
+clones those views only for serialization. Cache/RoPE/scratch state is
+pooled by shape. Default evaluation batch is 512; callers with fewer rows
+still use the available batch rather than manufacturing scored examples.
+Rationale: one graph around an unrolled 512-step mutable loop is brittle
+and enormous; regional fullgraph compilation gets the fusion without
+obscuring the wire's snapshot/commit boundary.
 
 *Higher-effort CUDA addendum (same day, a9 ratified).* The preceding
 controller/cache boundary is superseded after direct 4090 measurement.
@@ -211,10 +216,12 @@ Adjacent `cache_batch_idx` rows let FA2 reuse that prefix, and a compiled
 two-key tail plus fp32 log-sum-exp merge adds each branch's distinct
 keys. Only after the two queries complete does the refresh enter the
 shared prefix. This is the same snapshot boundary, removes the explicit
-commit, and halves slab KV storage. Fused RoPE, norm-linear algebra,
-concurrent readout, quantization, and device parallelism are not part of
-the canonical path: the first three failed the end-to-end speed gate;
-the latter two were explicitly out of scope.
+commit, and halves slab KV storage. Recurrent RoPE keeps only the compact
+position tables: the compiled step gathers `[t,t-1]` and broadcasts the
+pair over the interleaved branch batch. FA2-integrated RoPE,
+norm-linear algebra, concurrent readout, quantization, and device
+parallelism are not part of the canonical path: the first three failed
+the end-to-end speed gate; the latter two were explicitly out of scope.
 
 ## Open
 
