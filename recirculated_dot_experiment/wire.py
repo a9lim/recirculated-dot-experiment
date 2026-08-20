@@ -71,69 +71,67 @@ import torch
 from torch import Tensor
 from transformers import AttentionInterface, AttentionMaskInterface
 
-try:
-    from flash_attn import flash_attn_with_kvcache as _fa2_kvcache
-except ImportError:  # module stays importable; the engine refuses to build
-    _fa2_kvcache = None
+# Hard requirement (D10): no degraded mode — the module refuses to import
+# without flash-attn, by design.
+from flash_attn import flash_attn_with_kvcache as _fa2_kvcache
 
-if _fa2_kvcache is not None:
-    # flash_attn 2.8 exposes fwd_kvcache as a raw C extension (PyCapsule),
-    # which dynamo cannot trace; wrapping it as a torch custom op with the
-    # cache mutations declared makes it an opaque-but-graphable extern.
-    @torch.library.custom_op("wire::fa2_kvcache", mutates_args=("k_cache", "v_cache"))
-    def _fa2_op(
-        q: Tensor,
-        k_cache: Tensor,
-        v_cache: Tensor,
-        k_new: Tensor,
-        v_new: Tensor,
-        cache_seqlens: Tensor,
-        scale: float,
-    ) -> Tensor:
-        return _fa2_kvcache(
-            q, k_cache, v_cache, k=k_new, v=v_new, cache_seqlens=cache_seqlens, softmax_scale=scale
-        )
+# flash_attn 2.8 exposes fwd_kvcache as a raw C extension (PyCapsule),
+# which dynamo cannot trace; wrapping it as a torch custom op with the
+# cache mutations declared makes it an opaque-but-graphable extern.
+@torch.library.custom_op("wire::fa2_kvcache", mutates_args=("k_cache", "v_cache"))
+def _fa2_op(
+    q: Tensor,
+    k_cache: Tensor,
+    v_cache: Tensor,
+    k_new: Tensor,
+    v_new: Tensor,
+    cache_seqlens: Tensor,
+    scale: float,
+) -> Tensor:
+    return _fa2_kvcache(
+        q, k_cache, v_cache, k=k_new, v=v_new, cache_seqlens=cache_seqlens, softmax_scale=scale
+    )
 
-    @_fa2_op.register_fake
-    def _(q, k_cache, v_cache, k_new, v_new, cache_seqlens, scale):
-        return torch.empty_like(q)
+@_fa2_op.register_fake
+def _(q, k_cache, v_cache, k_new, v_new, cache_seqlens, scale):
+    return torch.empty_like(q)
 
-    from transformers.integrations.flash_attention import flash_attention_forward
-    from transformers.masking_utils import flash_attention_mask
+from transformers.integrations.flash_attention import flash_attention_forward
+from transformers.masking_utils import flash_attention_mask
 
-    def _wire_attention(module, query, key, value, attention_mask, **kwargs):
-        """FA2 everywhere (D10 addendum). Dual-pass steps (wire_cache set)
-        go through the kvcache custom op; everything else — pass A's
-        maskless causal prefill, plain HF forwards on the flipped model —
-        defers to HF's flash_attention_2 interface, which handles causal,
-        sliding-window, and padding/unpadding. The paired mask-interface
-        registration makes create_causal_mask build FA2-format inputs
-        (None when fully causal, 2D for padding) instead of dense 4D."""
-        cache = kwargs.get("wire_cache")
-        if cache is None:
-            # HF's delegate resolves the flash package by reading
-            # module.config._attn_implementation; scope the name to the
-            # stock one for exactly this call (outside it, the config must
-            # keep saying wire_attention so mask building stays FA2-format
-            # and dispatch keeps hitting this function).
-            mc = module.config
-            mc._attn_implementation = "flash_attention_2"
-            try:
-                return flash_attention_forward(module, query, key, value, attention_mask, **kwargs)
-            finally:
-                mc._attn_implementation = "wire_attention"
-        out = _fa2_op(
-            query.transpose(1, 2),
-            *cache.views(module.layer_idx),
-            key.transpose(1, 2),
-            value.transpose(1, 2),
-            cache.seqlens,
-            kwargs.get("scaling"),
-        )
-        return out, None
+def _wire_attention(module, query, key, value, attention_mask, **kwargs):
+    """FA2 everywhere (D10 addendum). Dual-pass steps (wire_cache set)
+    go through the kvcache custom op; everything else — pass A's
+    maskless causal prefill, plain HF forwards on the flipped model —
+    defers to HF's flash_attention_2 interface, which handles causal,
+    sliding-window, and padding/unpadding. The paired mask-interface
+    registration makes create_causal_mask build FA2-format inputs
+    (None when fully causal, 2D for padding) instead of dense 4D."""
+    cache = kwargs.get("wire_cache")
+    if cache is None:
+        # HF's delegate resolves the flash package by reading
+        # module.config._attn_implementation; scope the name to the
+        # stock one for exactly this call (outside it, the config must
+        # keep saying wire_attention so mask building stays FA2-format
+        # and dispatch keeps hitting this function).
+        mc = module.config
+        mc._attn_implementation = "flash_attention_2"
+        try:
+            return flash_attention_forward(module, query, key, value, attention_mask, **kwargs)
+        finally:
+            mc._attn_implementation = "wire_attention"
+    out = _fa2_op(
+        query.transpose(1, 2),
+        *cache.views(module.layer_idx),
+        key.transpose(1, 2),
+        value.transpose(1, 2),
+        cache.seqlens,
+        kwargs.get("scaling"),
+    )
+    return out, None
 
-    AttentionInterface.register("wire_attention", _wire_attention)
-    AttentionMaskInterface.register("wire_attention", flash_attention_mask)
+AttentionInterface.register("wire_attention", _wire_attention)
+AttentionMaskInterface.register("wire_attention", flash_attention_mask)
 
 
 @dataclass
@@ -213,8 +211,6 @@ class RecirculationEngine:
         mc = model.config
         if not 0 <= cfg.dest < cfg.source < mc.num_hidden_layers:
             raise ValueError(f"need 0 <= dest < source < {mc.num_hidden_layers}")
-        if _fa2_kvcache is None:
-            raise ValueError("the canonical wire requires the flash-attn package (D10)")
         # FA2 everywhere: the flip is safe regardless of the load-time
         # implementation because every forward after it — pass A, wire
         # steps, plain model(...) — dispatches through _wire_attention,

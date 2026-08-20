@@ -7,6 +7,9 @@ requires-python = ">=3.12,<3.13"
 license = "CC-BY-SA-4.0"
 license-files = ["LICENSE"]
 authors = [{ name = "a9lim", email = "mx@a9l.im" }]
+# flash-attn is a hard import of the wire (D10) but deliberately not
+# declared here: it is machine-owned (jobe's venv pins the prebuilt wheel
+# via constraints.txt) and has no universal wheels to resolve elsewhere.
 dependencies = [
     "torch>=2.8",
     # ~= pin: the wire drives Gemma3 layer internals and relies on private
