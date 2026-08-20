@@ -328,16 +328,18 @@ class RecirculationEngine:
             qkv_weights.append(
                 torch.cat(
                     [attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight], dim=0
-                ).contiguous()
+                )
+                .contiguous()
+                .detach()
             )
             biases = (attn.q_proj.bias, attn.k_proj.bias, attn.v_proj.bias)
             qkv_biases.append(
                 torch.cat(biases, dim=0).contiguous() if biases[0] is not None else None
             )
             gate_up_weights.append(
-                torch.cat(
-                    [layer.mlp.gate_proj.weight, layer.mlp.up_proj.weight], dim=0
-                ).contiguous()
+                torch.cat([layer.mlp.gate_proj.weight, layer.mlp.up_proj.weight], dim=0)
+                .contiguous()
+                .detach()
             )
         self._qkv_weights = tuple(qkv_weights)
         self._qkv_biases = tuple(qkv_biases)
@@ -459,12 +461,16 @@ class RecirculationEngine:
             or c.k.dtype != dtype
             or c.k.device != torch.device(device)
         ):
+            # flash-attn 2.8's kvcache kernel requires a physical cache
+            # length of at least four even when the visible sequence is
+            # shorter. cache_seqlens still enforces the exact T=1..3 view.
+            capacity = max(T, 4)
             self._cache = DualCache(
                 self.n_layers - self.cfg.dest - 1,
                 self.cfg.dest + 1,
                 B,
                 self.kv_heads,
-                T,
+                capacity,
                 self.head_dim,
                 self.hidden_size,
                 dtype,
