@@ -157,6 +157,21 @@ change) — the engine at α=0 sits *inside* that null (mean |Δlogit|
 5.3e-2 vs 5.5e-2; top-1 0.982 vs 0.965; ppl rel 7e-4). The last fp32
 proof of the same algorithm: max |Δlogit| 1.2e-4 (2026-08-20).
 
+*Addendum (same day, a9 ratified): stock sdpa fully retired.* The
+fallback tier (pass A's causal prefill, plain `model(...)` forwards)
+now defers to HF's flash_attention_2 interface, with the paired
+AttentionMaskInterface registration so `create_causal_mask` builds
+FA2-format inputs (None / 2D padding) for our impl name — replacing
+the implicit unknown-name-defaults-to-4D contract with an explicit
+registered pair. Models load with
+`attn_implementation="wire_attention"` so baselines run identical
+kernels before and after engine construction. Consequence, recorded:
+the whole flipped model object is half-precision-only, not just the
+wire — no fp32 baseline will ever run through it. FA2 null re-measured
+(mean 5.5e-2, top-1 0.9785 — unchanged in kind); thresholds stand;
+gates green (identity inside the null; PG19 −8.93%, C4 −5.03%,
+5 s/3 s).
+
 ## Open
 
 - Reachability negatives are unconstrained; if shortcut heuristics

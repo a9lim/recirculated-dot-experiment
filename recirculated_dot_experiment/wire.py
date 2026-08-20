@@ -42,15 +42,17 @@ NLL / logits are computed chunked at the end from collected top
 hiddens — per-step fp32 softmax over Gemma3's 262k vocab would
 dominate runtime and memory.
 
-Constraints enforced: an sdpa-family attention implementation at load
-(pass A relies on sdpa synthesizing causality for maskless q_len > 1;
-eager attention would attend bidirectionally there), sequences within
-one sliding window (where sliding and full attention coincide), CUDA +
-bf16/fp16 at call time (FlashAttention's envelope; the fp32 identity
-gate retired with the sdpa path — G0 now gates in bf16 against the
-plain HF forward, thresholds pinned from the measured noise floor).
-`final_logit_softcapping` is applied when the config carries it (None
-on Gemma3-1B).
+Attention is FA2 everywhere (D10 addendum, ratified 2026-08-20): wire
+steps use the kvcache custom op; pass A and plain HF forwards on the
+flipped model defer to HF's flash_attention_2 interface with the
+paired mask-interface registration — stock sdpa is fully retired, and
+the whole flipped model object is half-precision-only as a
+consequence. Constraints enforced: sequences within one sliding
+window (where sliding and full attention coincide), CUDA + bf16/fp16
+at call time (the fp32 identity gate retired at canonicalization —
+G0 gates in bf16 with thresholds calibrated against the measured
+self-noise null). `final_logit_softcapping` is applied when the
+config carries it (None on Gemma3-1B).
 
 Inference-only (`inference_mode`): the in-place lane buffers break
 autograd. The BPTT training path gets a functional token-chunked cache
@@ -67,8 +69,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import Tensor
-from transformers import AttentionInterface
-from transformers.integrations.sdpa_attention import sdpa_attention_forward
+from transformers import AttentionInterface, AttentionMaskInterface
 
 try:
     from flash_attn import flash_attn_with_kvcache as _fa2_kvcache
@@ -97,27 +98,42 @@ if _fa2_kvcache is not None:
     def _(q, k_cache, v_cache, k_new, v_new, cache_seqlens, scale):
         return torch.empty_like(q)
 
+    from transformers.integrations.flash_attention import flash_attention_forward
+    from transformers.masking_utils import flash_attention_mask
 
-def _wire_attention(module, query, key, value, attention_mask, **kwargs):
-    """Dual-pass steps (wire_cache set) go through the FlashAttention
-    kvcache custom op; everything else — pass A's maskless causal
-    prefill, plain HF forwards on the flipped model — defers to stock
-    sdpa."""
-    cache = kwargs.get("wire_cache")
-    if cache is None:
-        return sdpa_attention_forward(module, query, key, value, attention_mask, **kwargs)
-    out = _fa2_op(
-        query.transpose(1, 2),
-        *cache.views(module.layer_idx),
-        key.transpose(1, 2),
-        value.transpose(1, 2),
-        cache.seqlens,
-        kwargs.get("scaling"),
-    )
-    return out, None
+    def _wire_attention(module, query, key, value, attention_mask, **kwargs):
+        """FA2 everywhere (D10 addendum). Dual-pass steps (wire_cache set)
+        go through the kvcache custom op; everything else — pass A's
+        maskless causal prefill, plain HF forwards on the flipped model —
+        defers to HF's flash_attention_2 interface, which handles causal,
+        sliding-window, and padding/unpadding. The paired mask-interface
+        registration makes create_causal_mask build FA2-format inputs
+        (None when fully causal, 2D for padding) instead of dense 4D."""
+        cache = kwargs.get("wire_cache")
+        if cache is None:
+            # HF's delegate resolves the flash package by reading
+            # module.config._attn_implementation; scope the name to the
+            # stock one for exactly this call (outside it, the config must
+            # keep saying wire_attention so mask building stays FA2-format
+            # and dispatch keeps hitting this function).
+            mc = module.config
+            mc._attn_implementation = "flash_attention_2"
+            try:
+                return flash_attention_forward(module, query, key, value, attention_mask, **kwargs)
+            finally:
+                mc._attn_implementation = "wire_attention"
+        out = _fa2_op(
+            query.transpose(1, 2),
+            *cache.views(module.layer_idx),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            cache.seqlens,
+            kwargs.get("scaling"),
+        )
+        return out, None
 
-
-AttentionInterface.register("wire_attention", _wire_attention)
+    AttentionInterface.register("wire_attention", _wire_attention)
+    AttentionMaskInterface.register("wire_attention", flash_attention_mask)
 
 
 @dataclass
@@ -197,10 +213,13 @@ class RecirculationEngine:
         mc = model.config
         if not 0 <= cfg.dest < cfg.source < mc.num_hidden_layers:
             raise ValueError(f"need 0 <= dest < source < {mc.num_hidden_layers}")
-        if mc._attn_implementation not in ("sdpa", "wire_attention"):
-            raise ValueError(f"engine requires sdpa attention, got {mc._attn_implementation!r}")
         if _fa2_kvcache is None:
             raise ValueError("the canonical wire requires the flash-attn package (D10)")
+        # FA2 everywhere: the flip is safe regardless of the load-time
+        # implementation because every forward after it — pass A, wire
+        # steps, plain model(...) — dispatches through _wire_attention,
+        # whose causality is explicit (module.is_causal / cache_seqlens),
+        # and the paired mask interface builds FA2-format mask inputs.
         mc._attn_implementation = "wire_attention"
         self.model = model
         self.cfg = cfg

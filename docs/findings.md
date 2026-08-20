@@ -154,3 +154,15 @@ kernel-order noise; thresholds (mean < 0.15, top-1 > 0.95, ppl rel
 < 2e-3) live in the ~20× gap between the null and machinery-bug
 scale. Method worth keeping: when a gate loses its exact reference,
 measure the self-noise null before pinning tolerances.
+
+**FA2-everywhere addendum (same day).** Stock sdpa retired from the
+fallback tier too: pass A and plain forwards defer to HF's
+flash_attention_2 interface, with the paired mask-interface
+registration (`AttentionMaskInterface`) so mask building matches.
+One wrinkle: HF's delegate resolves the flash package by reading
+`module.config._attn_implementation`, which says "wire_attention" —
+the name is scoped to "flash_attention_2" strictly inside the
+delegated call. FA2 null: mean 5.48e-2, top-1 0.9785 (same floor as
+sdpa's); identity PASS inside it; repro PG19 −8.93%, C4 −5.03%
+(baselines shifted ~1e-3 relative with the kernel change, as
+expected), 5 s/3 s unchanged. One attention library end to end.

@@ -35,8 +35,10 @@ def load_model(name: str, device: str):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(name)
+    # wire_attention (registered at wire import): FA2 everywhere, so the
+    # baselines run the same kernels before and after engine construction
     model = AutoModelForCausalLM.from_pretrained(
-        name, dtype=torch.bfloat16, attn_implementation="sdpa"
+        name, dtype=torch.bfloat16, attn_implementation="wire_attention"
     )
     model.to(device).eval()
     return tok, model
