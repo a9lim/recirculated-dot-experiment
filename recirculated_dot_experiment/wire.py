@@ -1,8 +1,9 @@
 """Two-pass recirculation engine for Gemma3 (design.md D1, D10).
 
 Canonical single path (ratified 2026-08-20): CUDA, half precision,
-FlashAttention kvcache for the dual pass, torch.compile over the serial
-slab. The sdpa dual-pass implementation, its mask machinery, and the
+FlashAttention kvcache for the dual pass, packed frozen projections,
+and fullgraph compilation of every tensor-heavy region. The sdpa
+dual-pass implementation, its mask machinery, and the
 backend/compile flags were stripped at canonicalization — the fastest
 path is the only path, so training and eval share one set of numerics.
 History and measurements live in docs/findings.md; the stripped
@@ -21,8 +22,8 @@ Structure the implementation exploits, all exact:
 
 1. Refresh only ever touches layers dest+1..top, so layers 0..dest of
    every column form a plain causal transformer — computed for the
-   whole sequence in ONE parallel prefill (pass A, stock sdpa). Only
-   the top slab is serial.
+   whole sequence in ONE compiled parallel FA2 prefill. Only the top
+   slab is serial.
 2. First pass of column t and second pass of column t-1 share a cache
    snapshot (the paper runs them concurrently), so they run as ONE
    batched [2B] call over the serial slab.
@@ -33,19 +34,26 @@ Structure the implementation exploits, all exact:
    mask tensor anywhere. Lane 0's refresh commits as one fused
    lane1->lane0 copy at step end (the next reader is step t+1, so
    end-of-step commit preserves the same-snapshot semantics exactly).
-4. The slab step is mutation-free from inductor's perspective (cache
-   writes hide inside the custom op; the commit lives outside the
-   graph), so it compiles fullgraph. flash-attn's raw PyCapsule entry
-   is wrapped as a torch custom op with the cache mutations declared.
+4. The tensor work is split into fullgraph regions for prefill, the
+   first slab step, the recurrent mix+slab step, and readout. Cache
+   writes hide inside a custom op and commits live in the small Python
+   state machine, so the recurrent graph remains mutation-free from
+   inductor's perspective. flash-attn's raw PyCapsule entries are
+   wrapped as torch custom ops.
+5. Gemma's frozen Q/K/V and gate/up weights are packed once, reducing
+   each decoder layer from seven GEMMs to four without changing the
+   stored model weights. RoPE, cache metadata, and output scratch are
+   shape-bucketed and reused.
 
-NLL / logits are computed chunked at the end from collected top
-hiddens — per-step fp32 softmax over Gemma3's 262k vocab would
-dominate runtime and memory.
+NLL / logits are computed in compiled chunks at the end from collected
+top hiddens. The NLL-only graph fuses fp32 log-softmax with target
+gather, avoiding the full fp32 [tokens, vocab] materialization.
 
 Attention is FA2 everywhere (D10 addendum, ratified 2026-08-20): wire
-steps use the kvcache custom op; pass A and plain HF forwards on the
-flipped model defer to HF's flash_attention_2 interface with the
-paired mask-interface registration — stock sdpa is fully retired, and
+steps use the kvcache custom op; pass A uses a compiled causal-prefill
+custom op; plain HF forwards on the flipped model defer to HF's
+flash_attention_2 interface with the paired mask-interface
+registration — stock sdpa is fully retired, and
 the whole flipped model object is half-precision-only as a
 consequence. Constraints enforced: sequences within one sliding
 window (where sliding and full attention coincide), CUDA + bf16/fp16
@@ -68,15 +76,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from torch import Tensor
-from torch.nn import functional as F
-from transformers.models.gemma3.modeling_gemma3 import apply_rotary_pos_emb
-from transformers import AttentionInterface, AttentionMaskInterface
 
 # Hard requirement (D10): no degraded mode — the module refuses to import
 # without flash-attn, by design.
 from flash_attn import flash_attn_func as _fa2_prefill
 from flash_attn import flash_attn_with_kvcache as _fa2_kvcache
+from torch import Tensor
+from torch.nn import functional as F
+from transformers import AttentionInterface, AttentionMaskInterface
+from transformers.models.gemma3.modeling_gemma3 import apply_rotary_pos_emb
+
 
 # flash_attn 2.8 exposes fwd_kvcache as a raw C extension (PyCapsule),
 # which dynamo cannot trace; wrapping it as a torch custom op with the
@@ -92,8 +101,15 @@ def _fa2_op(
     scale: float,
 ) -> Tensor:
     return _fa2_kvcache(
-        q, k_cache, v_cache, k=k_new, v=v_new, cache_seqlens=cache_seqlens, softmax_scale=scale
+        q,
+        k_cache,
+        v_cache,
+        k=k_new,
+        v=v_new,
+        cache_seqlens=cache_seqlens,
+        softmax_scale=scale,
     )
+
 
 @_fa2_op.register_fake
 def _(q, k_cache, v_cache, k_new, v_new, cache_seqlens, scale):
@@ -110,8 +126,10 @@ def _fa2_prefill_op(q: Tensor, k: Tensor, v: Tensor, scale: float) -> Tensor:
 def _(q, k, v, scale):
     return torch.empty_like(q)
 
+
 from transformers.integrations.flash_attention import flash_attention_forward
 from transformers.masking_utils import flash_attention_mask
+
 
 def _wire_attention(module, query, key, value, attention_mask, **kwargs):
     """FA2 everywhere (D10 addendum). Dual-pass steps (wire_cache set)
@@ -131,7 +149,9 @@ def _wire_attention(module, query, key, value, attention_mask, **kwargs):
         mc = module.config
         mc._attn_implementation = "flash_attention_2"
         try:
-            return flash_attention_forward(module, query, key, value, attention_mask, **kwargs)
+            return flash_attention_forward(
+                module, query, key, value, attention_mask, **kwargs
+            )
         finally:
             mc._attn_implementation = "wire_attention"
     out = _fa2_op(
@@ -143,6 +163,7 @@ def _wire_attention(module, query, key, value, attention_mask, **kwargs):
         kwargs.get("scaling"),
     )
     return out, None
+
 
 AttentionInterface.register("wire_attention", _wire_attention)
 AttentionMaskInterface.register("wire_attention", flash_attention_mask)
@@ -243,7 +264,9 @@ class DualCache:
         j = layer_idx - self.first
         return self.k[j, : self.rows], self.v[j, : self.rows]
 
-    def update(self, key_states: Tensor, value_states: Tensor, layer_idx: int, *a, **kw):
+    def update(
+        self, key_states: Tensor, value_states: Tensor, layer_idx: int, *a, **kw
+    ):
         return key_states, value_states  # the kvcache kernel does the write
 
     def commit(self, t: int) -> None:
@@ -312,17 +335,23 @@ class RecirculationEngine:
                 torch.cat(biases, dim=0).contiguous() if biases[0] is not None else None
             )
             gate_up_weights.append(
-                torch.cat([layer.mlp.gate_proj.weight, layer.mlp.up_proj.weight], dim=0).contiguous()
+                torch.cat(
+                    [layer.mlp.gate_proj.weight, layer.mlp.up_proj.weight], dim=0
+                ).contiguous()
             )
         self._qkv_weights = tuple(qkv_weights)
         self._qkv_biases = tuple(qkv_biases)
         self._gate_up_weights = tuple(gate_up_weights)
 
-    def _ensure_rope(self, dtype: torch.dtype, device: torch.device) -> dict[str, tuple[Tensor, Tensor]]:
+    def _ensure_rope(
+        self, dtype: torch.dtype, device: torch.device
+    ) -> dict[str, tuple[Tensor, Tensor]]:
         rope = self._rope
-        if rope is None or next(iter(rope.values()))[0].dtype != dtype or next(iter(rope.values()))[
-            0
-        ].device != device:
+        if (
+            rope is None
+            or next(iter(rope.values()))[0].dtype != dtype
+            or next(iter(rope.values()))[0].device != device
+        ):
             marker = torch.empty(1, 1, self.hidden_size, dtype=dtype, device=device)
             pos_ids = torch.arange(self.window, device=device).unsqueeze(0)
             self._rope = {
@@ -331,9 +360,9 @@ class RecirculationEngine:
         return self._rope
 
     def mix(self, h_s: Tensor, h_d: Tensor, alpha, beta) -> Tensor:
-        ratio = h_d.norm(dim=-1, keepdim=True) / h_s.norm(dim=-1, keepdim=True).clamp_min(
-            self.cfg.eps
-        )
+        ratio = h_d.norm(dim=-1, keepdim=True) / h_s.norm(
+            dim=-1, keepdim=True
+        ).clamp_min(self.cfg.eps)
         return beta * h_d + alpha * ratio * h_s
 
     def _layer(self, i: int, x: Tensor, pe, cache: DualCache | None) -> Tensor:
@@ -380,17 +409,24 @@ class RecirculationEngine:
     def _prefill(self, input_ids: Tensor, cos_f, sin_f, cos_s, sin_s) -> Tensor:
         h = self.embed(input_ids)
         for i in range(self.cfg.dest + 1):
-            pe = (cos_f, sin_f) if self.layer_types[i] == "full_attention" else (cos_s, sin_s)
+            pe = (
+                (cos_f, sin_f)
+                if self.layer_types[i] == "full_attention"
+                else (cos_s, sin_s)
+            )
             h = self._layer(i, h, pe, None)
         return h
 
     def _slab(self, x: Tensor, cos_f, sin_f, cos_s, sin_s):
-        """One step over layers dest+1..top (the t=0 step runs this body
-        eagerly; every later step runs the compiled version)."""
+        """One compiled step over layers dest+1..top."""
         cache = self._cache
         h_s = x[: cache.B]
         for i in range(self.cfg.dest + 1, self.n_layers):
-            pe = (cos_f, sin_f) if self.layer_types[i] == "full_attention" else (cos_s, sin_s)
+            pe = (
+                (cos_f, sin_f)
+                if self.layer_types[i] == "full_attention"
+                else (cos_s, sin_s)
+            )
             x = self._layer(i, x, pe, cache)
             if i == self.cfg.source:
                 h_s = x[: cache.B]
@@ -457,8 +493,9 @@ class RecirculationEngine:
         device = input_ids.device
         dtype = self.embed.weight.dtype
         if dtype not in (torch.bfloat16, torch.float16):
-            raise ValueError(f"the canonical wire is half-precision only, model is {dtype}")
-        cfg = self.cfg
+            raise ValueError(
+                f"the canonical wire is half-precision only, model is {dtype}"
+            )
         rope = self._ensure_rope(dtype, device)
         cf, sf = rope["full_attention"]
         cs, ss = rope["sliding_attention"]
@@ -466,9 +503,7 @@ class RecirculationEngine:
         # Pass A: layers 0..dest for all columns in parallel (exact: the
         # refresh never touches these layers, so nothing here ever sees
         # recirculated state). No cache — slab KVs are never read later.
-        h_dest = self._prefill_c(
-            input_ids, cf[:, :T], sf[:, :T], cs[:, :T], ss[:, :T]
-        )
+        h_dest = self._prefill_c(input_ids, cf[:, :T], sf[:, :T], cs[:, :T], ss[:, :T])
 
         # Serial slab: layers dest+1..top, batched dual pass. Slicing
         # rope_dual at [t-1 : t] yields (position t for the first half,

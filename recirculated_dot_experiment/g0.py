@@ -67,7 +67,9 @@ def batched(windows, batch, device):
         yield torch.tensor(windows[i : i + batch], device=device)
 
 
-def nll_sum(logits: torch.Tensor, ids: torch.Tensor, chunk: int = 64) -> tuple[float, int]:
+def nll_sum(
+    logits: torch.Tensor, ids: torch.Tensor, chunk: int = 64
+) -> tuple[float, int]:
     # chunked along positions: fp32 log_softmax over a 262k vocab at full
     # length would double the logits' multi-GB footprint
     total = 0.0
@@ -124,9 +126,15 @@ def main() -> None:
         ours = engine.teacher_forced_logits(ids).float()
         diff = (ours - base).abs()
         top1 = (ours.argmax(-1) == base.argmax(-1)).float().mean().item()
-        base_ppl = float(torch.exp(torch.tensor(nll_sum(base, ids)[0] / nll_sum(base, ids)[1])))
-        ours_ppl = float(torch.exp(torch.tensor(nll_sum(ours, ids)[0] / nll_sum(ours, ids)[1])))
-        print(f"max|dlogit| {diff.max():.2e}  mean|dlogit| {diff.mean():.2e}  top1 {top1:.4f}")
+        base_ppl = float(
+            torch.exp(torch.tensor(nll_sum(base, ids)[0] / nll_sum(base, ids)[1]))
+        )
+        ours_ppl = float(
+            torch.exp(torch.tensor(nll_sum(ours, ids)[0] / nll_sum(ours, ids)[1]))
+        )
+        print(
+            f"max|dlogit| {diff.max():.2e}  mean|dlogit| {diff.mean():.2e}  top1 {top1:.4f}"
+        )
         print(f"ppl plain {base_ppl:.4f}  engine(alpha=0) {ours_ppl:.4f}")
         # Thresholds calibrated against the measured bf16 null: the plain
         # HF forward vs ITSELF under a kernel-tiling change (batch-4 vs
@@ -147,18 +155,26 @@ def main() -> None:
     if args.pairs:
         pairs += [tuple(map(int, q.split(","))) for q in args.pairs.split(";")]
     for name in args.datasets.split(","):
-        windows = collect_windows(name, tok, args.windows, args.window_len, args.per_doc)
+        windows = collect_windows(
+            name, tok, args.windows, args.window_len, args.per_doc
+        )
         print(f"\n{name}: {len(windows)} windows x {args.window_len}")
         t0 = time.time()
         # baseline materializes full [B, T, 262k] logits — cap its batch
         base = perplexity(
-            lambda ids: nll_sum(model(ids).logits, ids), windows, min(args.batch, 16), device
+            lambda ids: nll_sum(model(ids).logits, ids),
+            windows,
+            min(args.batch, 16),
+            device,
         )
-        print(f"  baseline           ppl {base:8.3f}          ({time.time() - t0:.0f}s)")
+        print(
+            f"  baseline           ppl {base:8.3f}          ({time.time() - t0:.0f}s)"
+        )
         for s, d in pairs:
             engine = RecirculationEngine(
                 model, WireConfig(s, d, alpha=args.alpha, ramp_steps=args.ramp)
             )
+
             def engine_nll(ids, engine=engine):
                 nll, _ = engine.teacher_forced(ids)
                 return nll.sum().item(), nll.numel()

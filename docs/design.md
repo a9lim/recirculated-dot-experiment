@@ -172,6 +172,17 @@ wire — no fp32 baseline will ever run through it. FA2 null re-measured
 gates green (identity inside the null; PG19 −8.93%, C4 −5.03%,
 5 s/3 s).
 
+*CUDA compilation addendum (same day, a9 ratified).* Compile every
+tensor-heavy region that has a stable semantic boundary: packed-QKV /
+packed-gate-up pass A, the first slab step, recurrent mix+slab, and
+chunked readout. The outer position loop remains the authoritative
+Python state machine because it advances and commits the mutable dual
+cache; it performs no model math. Cache/RoPE/scratch state is pooled by
+shape. Default evaluation batch is 128. Rationale: one graph around an
+unrolled 512-step mutable loop is brittle and enormous; regional
+fullgraph compilation gets the fusion without obscuring the wire's
+snapshot/commit boundary.
+
 ## Open
 
 - Reachability negatives are unconstrained; if shortcut heuristics

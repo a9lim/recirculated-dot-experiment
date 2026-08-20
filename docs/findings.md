@@ -166,3 +166,30 @@ delegated call. FA2 null: mean 5.48e-2, top-1 0.9785 (same floor as
 sdpa's); identity PASS inside it; repro PG19 −8.93%, C4 −5.03%
 (baselines shifted ~1e-3 relative with the kernel change, as
 expected), 5 s/3 s unchanged. One attention library end to end.
+
+## Compile-everything and packed-projection pass (2026-08-20)
+
+Live RTX 4090 profiling at B=100, T=512 split the 3.08 s warm wire
+into 0.18 s pass A/setup, 2.40 s serial slab, and 0.50 s readout.
+Matrix multiplies were 53% of CUDA time and FA2 kvcache attention 28%.
+
+The landed path fullgraph-compiles pass A, the first slab step, the
+recurrent norm-ratio mix plus slab, and both readout modes. Q/K/V and
+gate/up are packed once from frozen weights; per-layer GEMMs fall from
+seven to four. RoPE, dual-lane RoPE, sequence-length schedules, KV, and
+top-hidden scratch are reused by shape. The only eager region left is
+the position state machine and its exact end-of-step cache commit.
+Python alpha/beta values are normalized to tensors; the default ramp
+is device-resident, preventing value-specialized recompilation.
+
+At B=128, T=512 the final warm time is **2.84 s** (23.1k token/s),
+versus 3.52 s (18.6k token/s) before this pass: **1.24x throughput**.
+The phase split is 0.127 s prefill, 2.442 s serial slab, and 0.268 s
+commit plus readout. Persistent packed weights raise post-compile peak
+allocation to 9.36 GiB, still leaving ample 4090 headroom. Compile-cold
+time is 13.65 s and is amortized by repeated batches.
+
+Gates: bf16 identity PASS (mean |dlogit| 5.81e-2, top-1 0.9902,
+plain/engine ppl 27.0229/27.0260); full 100x512 reproduction at the new
+default batch gives PG19 **-9.00%** and C4 **-5.11%**. `max-autotune`,
+FA2 `num_splits`, and larger readout chunks remained measured nulls.
