@@ -139,6 +139,35 @@ smaller k as a causal prefix — mathematically the same prefix, so the
 max-k shape is the canonical sweep definition; both trained arms use
 the identical live-row bf16 readout.
 
+**Free running (D14).** The forced k-sweep never measures D4/D12's
+actual claim — that the model chooses when to stop dotting — so a
+free-running readout rides beside it, *derived* rather than rolled
+out: content-free identical dots make a free rollout's prefix equal
+to the teacher-forced one (while the model emits `<t>`, the forced
+input is exactly what it would have generated), and every position's
+readout is causal, so free-running behavior is computed from the same
+max-k run. Two arms from the per-position full-vocab logits:
+
+- *Greedy*: halt at the first position whose unrestricted argmax is
+  not `<t>`; score the emitted token (accuracy, legality, halt
+  position). A trajectory that never halts within the budget scores
+  as wrong and is reported as such, never hidden.
+- *Sampled, in closed form*: with p_t(·) the position-t softmax, the
+  halt-time law is P(halt at t) = (1 − p_t(`<t>`))·∏_{s<t} p_s(`<t>`)
+  and the mass on emitting the gold answer as the halting token is
+  Σ_t p_t(gold)·∏_{s<t} p_s(`<t>`) — an exact marginalization over
+  all rollouts, no Monte Carlo. Soft-everywhere: the halt mass, gold
+  mass, legal mass, and expected halt time are all reported as
+  masses, not thresholded.
+
+Exact up to the sweep's max k; applies to every dot arm in any scope.
+CoT free-running would need true ragged generation and stays
+teacher-forced with the frozen topline. Beyond honesty about halting,
+this adds a second discriminating axis to the 2×2: without the wire,
+per-dot emission logits see the prompt but nothing accumulates
+"doneness" across dots, so instance-conditional halting correlated
+with serial difficulty is itself wire evidence.
+
 ## Training recipe
 
 **Surface (D2).** The entire trainable state: the `<t>` embedding row

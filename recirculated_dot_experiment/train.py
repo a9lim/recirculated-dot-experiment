@@ -1563,6 +1563,13 @@ def run_mode(args) -> None:
 
 
 def main() -> None:
+    # The training surface legitimately compiles a shape family per k
+    # (span strides, rope slices, and prefix lengths all carry k), and
+    # Dynamo's default 8-per-frame guard hard-aborts under fullgraph
+    # mid-warmup (seen at k=32 on _dual_layer_math). Raised at CLI scope
+    # only — imports never touch global config — and the guard against
+    # *accidental* recompiles remains the in-step unique-graph audit.
+    torch._dynamo.config.recompile_limit = 256
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("mode", choices=["gate", "run"])
     p.add_argument("--model", default="google/gemma-3-1b-pt")

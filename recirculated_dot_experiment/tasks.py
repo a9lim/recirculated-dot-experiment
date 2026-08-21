@@ -239,6 +239,9 @@ def evaluate_dot_sweep(
 
 
 def main() -> None:
+    # The think/dots adapters drive train's compiled shape-per-k family;
+    # raise Dynamo's per-frame guard at CLI scope (see train.main).
+    torch._dynamo.config.recompile_limit = 256
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--tasks", default="s5_chain,parity,reachability,threesum")
     p.add_argument(
