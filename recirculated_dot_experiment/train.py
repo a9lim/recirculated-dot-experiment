@@ -59,6 +59,7 @@ import math
 import random
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -93,6 +94,51 @@ class GateMLP(nn.Module):
         x = self.out(F.gelu(self.h2(F.gelu(self.h1(self.norm(x))))))
         alpha, beta = torch.sigmoid(x).chunk(2, dim=-1)
         return alpha, beta
+
+
+def _gate_mix_math(
+    cfg_eps: float,
+    h_s: Tensor,
+    h_d: Tensor,
+    norm_weight: Tensor,
+    norm_bias: Tensor,
+    h1_weight: Tensor,
+    h1_bias: Tensor,
+    h2_weight: Tensor,
+    h2_bias: Tensor,
+    out_weight: Tensor,
+    out_bias: Tensor,
+) -> Tensor:
+    """Tensor-only adaptive gate plus norm-matched residual mix."""
+    x = torch.cat((h_s, h_d), dim=-1)
+    x = F.layer_norm(x, (norm_weight.shape[0],), norm_weight, norm_bias)
+    x = F.gelu(F.linear(x, h1_weight, h1_bias))
+    x = F.gelu(F.linear(x, h2_weight, h2_bias))
+    alpha, beta = torch.sigmoid(F.linear(x, out_weight, out_bias)).chunk(2, dim=-1)
+    ratio = h_d.norm(dim=-1, keepdim=True) / h_s.norm(
+        dim=-1, keepdim=True
+    ).clamp_min(cfg_eps)
+    return beta * h_d + alpha * ratio * h_s
+
+
+_gate_mix_c = torch.compile(_gate_mix_math, fullgraph=True, dynamic=True)
+
+
+def _gate_mix(gate: GateMLP, h_s: Tensor, h_d: Tensor, eps: float = 1e-6) -> Tensor:
+    """Compiled adaptive-alpha surface used by the functional train path."""
+    return _gate_mix_c(
+        eps,
+        h_s,
+        h_d,
+        gate.norm.weight,
+        gate.norm.bias,
+        gate.h1.weight,
+        gate.h1.bias,
+        gate.h2.weight,
+        gate.h2.bias,
+        gate.out.weight,
+        gate.out.bias,
+    )
 
 
 class Surface(nn.Module):
@@ -429,7 +475,7 @@ def _span_parallel(model, packed, x, span_rope, prompt_kv, lo, hi, ckpt):
             *_layer_args(model, packed, i),
             True,
         )
-        if ckpt:
+        if _checkpoint_layer(ckpt, i):
             x, _, _ = checkpoint(_single_layer_c, *args, use_reentrant=False)
         else:
             x, _, _ = _single_layer_c(*args)
@@ -448,7 +494,7 @@ def _slab_first(model, packed, x, pe_sl, rope, shared, lo, hi, source, ckpt):
             *_layer_args(model, packed, i),
             False,
         )
-        if ckpt:
+        if _checkpoint_layer(ckpt, i):
             x, k, v = checkpoint(_single_layer_c, *args, use_reentrant=False)
         else:
             x, k, v = _single_layer_c(*args)
@@ -491,7 +537,7 @@ def _slab_pair(
             *shared[i][0],
             *shared[i][1],
         )
-        if ckpt:
+        if _checkpoint_layer(ckpt, i):
             out = checkpoint(_dual_layer_from_pieces, *args, use_reentrant=False)
         else:
             out = _dual_layer_from_pieces(*args)
@@ -553,8 +599,7 @@ def think_outputs(
     frontier = {i: new_kv[j] for j, i in enumerate(slab)}
     tops.append(x1)
     for t in range(1, k):
-        alpha, beta = surface.gate(h_s_prev, h_dest[:, t - 1 : t])
-        refresh = _mix(1e-6, h_s_prev, h_dest[:, t - 1 : t], alpha, beta)
+        refresh = _gate_mix(surface.gate, h_s_prev, h_dest[:, t - 1 : t])
         _, x1, h_s, refresh_kv, first_kv = _slab_pair(
             model,
             packed,
@@ -858,7 +903,7 @@ def _loss_and_grads(loss_fn, surface: Surface) -> tuple[float, dict[str, Tensor]
 
 
 def _checkpoint_for(policy: str, batch: int, k: int) -> bool:
-    """Use recomputation only beyond the measured RTX 4090 memory knee."""
+    """Compatibility predicate for the measured RTX 4090 memory knee."""
     if policy == "always":
         return True
     if policy == "never":
@@ -866,6 +911,58 @@ def _checkpoint_for(policy: str, batch: int, k: int) -> bool:
     if policy != "auto":
         raise ValueError(f"unknown checkpoint policy {policy!r}")
     return batch * k > 2048
+
+
+CheckpointSpec = bool | frozenset[int]
+
+
+def _checkpoint_layer(spec: CheckpointSpec, layer: int) -> bool:
+    return spec if isinstance(spec, bool) else layer in spec
+
+
+@dataclass(frozen=True)
+class ExecutionPlan:
+    """One optimizer batch expressed as equal-shape CUDA microbatches."""
+
+    microbatch: int
+    checkpoint_layers: frozenset[int]
+
+
+def _largest_divisor_at_most(value: int, limit: int) -> int:
+    """Keep every microbatch shape identical so it reuses one compilation."""
+    for candidate in range(min(value, limit), 0, -1):
+        if value % candidate == 0:
+            return candidate
+    raise AssertionError("one always divides a positive batch")
+
+
+def _execution_plan(
+    policy: str,
+    batch: int,
+    k: int,
+    n_layers: int,
+) -> ExecutionPlan:
+    """Select physical batch and checkpoint layers from measured 4090 knees.
+
+    ``batch`` remains the optimizer/effective batch. Short spans retain
+    activations in equal B*k<=2048 microbatches; long spans run the full
+    batch with recomputation because the larger GEMMs recover more throughput.
+    """
+    if batch < 1 or k < 1:
+        raise ValueError(f"batch and k must be positive, got B={batch}, k={k}")
+    layers = frozenset(range(n_layers))
+    if policy == "always":
+        return ExecutionPlan(batch, layers)
+    if policy == "never":
+        return ExecutionPlan(batch, frozenset())
+    if policy != "auto":
+        raise ValueError(f"unknown checkpoint policy {policy!r}")
+    if batch * k <= 2048:
+        return ExecutionPlan(batch, frozenset())
+    if k <= 8:
+        microbatch = _largest_divisor_at_most(batch, max(1, 2048 // k))
+        return ExecutionPlan(microbatch, frozenset())
+    return ExecutionPlan(batch, layers)
 
 
 def gate_mode(args) -> None:
@@ -1057,6 +1154,56 @@ def _forward_loss(model, surface, ids, answers, start, args, ckpt):
     return span_loss(model, surface, h, answers, args.lam)
 
 
+def _run_microbatches(
+    model,
+    surface,
+    ids_cpu,
+    answers_cpu,
+    span_start,
+    args,
+    plan: ExecutionPlan,
+    *,
+    accumulate: bool,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Run one effective batch through equal compiled CUDA shapes.
+
+    Gradients and reported losses are weighted by row count, making a
+    microbatched step identical to the effective-batch mean objective.
+    """
+    total = ids_cpu.shape[0]
+    if total % plan.microbatch:
+        raise ValueError(
+            f"effective batch {total} is not divisible by B={plan.microbatch}"
+        )
+    params = tuple(surface.parameters())
+    metrics = None
+    for offset in range(0, total, plan.microbatch):
+        stop = offset + plan.microbatch
+        ids = ids_cpu[offset:stop].to("cuda", non_blocking=True)
+        answers = answers_cpu[offset:stop].to("cuda", non_blocking=True)
+        values = _forward_loss(
+            model,
+            surface,
+            ids,
+            answers,
+            span_start,
+            args,
+            plan.checkpoint_layers,
+        )
+        fraction = plan.microbatch / total
+        scaled_loss = values[0] * fraction
+        if accumulate:
+            scaled_loss.backward()
+        else:
+            torch.autograd.grad(scaled_loss, params, allow_unused=True)
+        weighted = tuple(value.detach() * fraction for value in values)
+        metrics = weighted if metrics is None else tuple(
+            old + new for old, new in zip(metrics, weighted)
+        )
+    assert metrics is not None
+    return metrics
+
+
 def run_mode(args) -> None:
     from .wire import load_model
 
@@ -1066,7 +1213,9 @@ def run_mode(args) -> None:
     tok, model = load_model(args.model, "cuda")
     dot_id = tasks.single_token(tok, tasks.DOT)
     surface = Surface(model, dot_id).cuda()
-    opt = torch.optim.AdamW(surface.parameters(), lr=args.lr, weight_decay=0.0)
+    opt = torch.optim.AdamW(
+        surface.parameters(), lr=args.lr, weight_decay=0.0, fused=True
+    )
     task_list = args.tasks.split(",")
     k_set = [int(s) for s in args.k.split(",")]
     start_step = 1
@@ -1096,15 +1245,22 @@ def run_mode(args) -> None:
             _, _, ids_cpu, answers_cpu, span_start = _make_cpu_batch(
                 tok, warm_args, [warm_task], [warm_k], warm_index
             )
-            ids = ids_cpu.to("cuda", non_blocking=True)
-            answers = answers_cpu.to("cuda", non_blocking=True)
-            warm_ckpt = _checkpoint_for(args.checkpoint, args.batch, warm_k)
-            warm_loss = _forward_loss(
-                model, surface, ids, answers, span_start, args, warm_ckpt
-            )[0]
-            torch.autograd.grad(
-                warm_loss, tuple(surface.parameters()), allow_unused=True
+            warm_plan = _execution_plan(
+                args.checkpoint,
+                args.batch,
+                warm_k,
+                model.config.num_hidden_layers,
             )
+            warm_loss = _run_microbatches(
+                model,
+                surface,
+                ids_cpu,
+                answers_cpu,
+                span_start,
+                args,
+                warm_plan,
+                accumulate=False,
+            )[0]
         if args.eval_every:
             for task_name in task_list:
                 evaluate_sweep(
@@ -1125,7 +1281,7 @@ def run_mode(args) -> None:
             f"compile/warmup {time.perf_counter() - compile_start:.1f}s "
             f"({compiled_graphs} graphs, not timed)"
         )
-        del warm_loss, ids, answers, ids_cpu, answers_cpu
+        del warm_loss, ids_cpu, answers_cpu
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -1133,14 +1289,20 @@ def run_mode(args) -> None:
 
         for step in range(start_step, args.steps + 1):
             task, k, ids_cpu, answers_cpu, span_start = producer.get(step)
-            ids = ids_cpu.to("cuda", non_blocking=True)
-            answers = answers_cpu.to("cuda", non_blocking=True)
-            ckpt = _checkpoint_for(args.checkpoint, args.batch, k)
-            loss, ce_ans, ce_emit = _forward_loss(
-                model, surface, ids, answers, span_start, args, ckpt
-            )
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            plan = _execution_plan(
+                args.checkpoint, args.batch, k, model.config.num_hidden_layers
+            )
+            loss, ce_ans, ce_emit = _run_microbatches(
+                model,
+                surface,
+                ids_cpu,
+                answers_cpu,
+                span_start,
+                args,
+                plan,
+                accumulate=True,
+            )
             current_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
             if current_graphs != compiled_graphs:
                 raise RuntimeError(
@@ -1160,7 +1322,8 @@ def run_mode(args) -> None:
                 dt = time.perf_counter() - t0
                 peak = torch.cuda.max_memory_allocated() / 2**30
                 print(
-                    f"step {step:5d}  {task:12s} k={k:2d}  "
+                    f"step {step:5d}  {task:12s} k={k:2d} "
+                    f"B={plan.microbatch}x{args.batch // plan.microbatch}  "
                     f"loss {float(loss.detach()):.4f}  "
                     f"answer {float(ce_ans.detach()):.4f}  "
                     f"emit {float(ce_emit.detach()):.4f}  "
@@ -1206,7 +1369,12 @@ def main() -> None:
     p.add_argument("--condition", choices=["dots+wire", "dots"], default="dots+wire")
     p.add_argument("--tasks", default="parity")
     p.add_argument("--k", default="1,2,4,8,16,32")
-    p.add_argument("--batch", type=int, default=256)
+    p.add_argument(
+        "--batch",
+        type=int,
+        default=512,
+        help="effective optimizer batch; auto mode chooses the CUDA microbatch",
+    )
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--lam", type=float, default=1.0)

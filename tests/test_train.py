@@ -7,8 +7,12 @@ from torch import nn
 pytest.importorskip("flash_attn")
 
 from recirculated_dot_experiment.train import (
+    GateMLP,
     Surface,
     _checkpoint_for,
+    _execution_plan,
+    _gate_mix_math,
+    _mix,
     _step_choice,
 )
 
@@ -18,6 +22,49 @@ def test_checkpoint_policy_uses_measured_memory_knee():
     assert _checkpoint_for("auto", 512, 8)
     assert _checkpoint_for("always", 1, 1)
     assert not _checkpoint_for("never", 4096, 32)
+
+
+def test_execution_plan_keeps_effective_batch_and_compiled_shapes():
+    assert _execution_plan("auto", 512, 4, 26).microbatch == 512
+    assert _execution_plan("auto", 512, 8, 26).microbatch == 256
+    assert _execution_plan("auto", 512, 16, 26).microbatch == 512
+    assert not _execution_plan("auto", 512, 8, 26).checkpoint_layers
+    assert len(_execution_plan("auto", 512, 16, 26).checkpoint_layers) == 26
+    assert _execution_plan("auto", 510, 8, 26).microbatch == 255
+
+
+def test_tensor_gate_mix_matches_module_path_and_gradients():
+    torch.manual_seed(17)
+    gate = GateMLP(8).to(dtype=torch.bfloat16)
+    with torch.no_grad():
+        gate.out.weight.normal_(std=1e-3)
+    source = torch.randn(3, 1, 8, dtype=torch.bfloat16, requires_grad=True)
+    dest = torch.randn(3, 1, 8, dtype=torch.bfloat16, requires_grad=True)
+    alpha, beta = gate(source, dest)
+    expected = _mix(1e-6, source, dest, alpha, beta)
+    actual = _gate_mix_math(
+        1e-6,
+        source,
+        dest,
+        gate.norm.weight,
+        gate.norm.bias,
+        gate.h1.weight,
+        gate.h1.bias,
+        gate.h2.weight,
+        gate.h2.bias,
+        gate.out.weight,
+        gate.out.bias,
+    )
+    assert torch.equal(expected, actual)
+
+    expected.sum().backward(retain_graph=True)
+    expected_grads = [parameter.grad.clone() for parameter in gate.parameters()]
+    gate.zero_grad(set_to_none=True)
+    actual.sum().backward()
+    assert all(
+        torch.equal(want, parameter.grad)
+        for want, parameter in zip(expected_grads, gate.parameters())
+    )
 
 
 def test_step_schedule_is_addressable_and_deterministic():
