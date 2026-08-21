@@ -460,7 +460,8 @@ def _prompt_prefill(model, packed, prompt_ids: Tensor):
 
 @dataclass
 class _PromptCacheEntry:
-    tensors: tuple[Tensor, ...]
+    packed: Tensor
+    shapes: tuple[torch.Size, ...]
     ready: torch.cuda.Event
     nbytes: int
 
@@ -491,6 +492,16 @@ class PromptStateCache:
     def _unflatten(tensors: tuple[Tensor, ...]):
         return tensors[0], list(zip(tensors[1::2], tensors[2::2]))
 
+    @classmethod
+    def _views(cls, packed: Tensor, shapes: tuple[torch.Size, ...]):
+        tensors = []
+        offset = 0
+        for shape in shapes:
+            size = math.prod(shape)
+            tensors.append(packed.narrow(0, offset, size).view(shape))
+            offset += size
+        return cls._unflatten(tuple(tensors))
+
     def _key(self, ids: Tensor, start: int) -> tuple:
         prompt = ids[:, :start]
         # Evaluation input construction starts on CPU, but the adapter API is
@@ -506,10 +517,8 @@ class PromptStateCache:
             self.hits += 1
             self.entries[key] = entry
             current.wait_event(entry.ready)
-            tensors = tuple(
-                tensor.to(ids.device, non_blocking=True) for tensor in entry.tensors
-            )
-            return self._unflatten(tensors)
+            packed = entry.packed.to(ids.device, non_blocking=True)
+            return self._views(packed, entry.shapes)
 
         self.misses += 1
         state = _prompt_prefill(
@@ -518,17 +527,24 @@ class PromptStateCache:
             ids[:, :start],
         )
         source = self._flatten(state)
-        host = tuple(
-            torch.empty_like(tensor, device="cpu", pin_memory=True) for tensor in source
+        shapes = tuple(tensor.shape for tensor in source)
+        sizes = tuple(tensor.numel() for tensor in source)
+        host = torch.empty(
+            sum(sizes),
+            dtype=source[0].dtype,
+            device="cpu",
+            pin_memory=True,
         )
         with torch.cuda.stream(self.stream):
             self.stream.wait_stream(current)
-            for target, tensor in zip(host, source):
-                target.copy_(tensor, non_blocking=True)
+            offset = 0
+            for size, tensor in zip(sizes, source):
+                host.narrow(0, offset, size).copy_(tensor.reshape(-1), non_blocking=True)
                 tensor.record_stream(self.stream)
+                offset += size
             ready = self.stream.record_event()
-        nbytes = sum(tensor.numel() * tensor.element_size() for tensor in host)
-        self.entries[key] = _PromptCacheEntry(host, ready, nbytes)
+        nbytes = host.numel() * host.element_size()
+        self.entries[key] = _PromptCacheEntry(host, shapes, ready, nbytes)
         self.bytes += nbytes
         while self.bytes > self.max_bytes and len(self.entries) > 1:
             _, evicted = self.entries.popitem(last=False)
