@@ -37,3 +37,13 @@ def test_surface_has_only_bf16_parameters():
     )
     surface = Surface(model, 7)
     assert {parameter.dtype for parameter in surface.parameters()} == {torch.bfloat16}
+
+
+def test_surface_rejects_non_bf16_base():
+    embedding = nn.Embedding(128, 16, dtype=torch.float32)
+    model = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=16),
+        model=SimpleNamespace(embed_tokens=embedding),
+    )
+    with pytest.raises(TypeError, match="requires BF16"):
+        Surface(model, 7)

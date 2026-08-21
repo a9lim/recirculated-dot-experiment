@@ -16,10 +16,11 @@ gate MLP supplying alpha,beta at each mix.
 Functional cache (D9): per slab layer, the detached prompt KV, a
 tuple of settled one-token refreshed KVs, and the previous column's
 first-pass frontier KV. Nothing in the graph is ever overwritten;
-dual views are cat'd inside checkpointed layer calls (use_reentrant=
-False) so no assembled K/V survives the forward. Attention is
-flash_attn_func — differentiable, unlike the inference kvcache op
-(D9 amendment: the training path shares kernels, not custom ops).
+the refresh and first-pass branches share one packed projection and
+one differentiable FA2-varlen call. KV views are assembled inside
+checkpointed layer calls, so no prefix copy survives the forward.
+Prompt, span, serial layers, and the frozen projections use the same
+packed, regionally compiled tensor math.
 
 Supervision (D12, a9's call): lm_head over the whole emission span —
 the last prompt position and every dot target `<t>`, the last dot
@@ -28,18 +29,24 @@ hazard, activating D4's halting-by-sampling. Loss is
 CE(answer) + lambda*mean(CE(emission)) so the task gradient is
 k-independent; dot targets carry no task content, so credit for the
 computation still flows only through the answer (H2 stays clean).
-The head is chunked and checkpointed; logits for the `<t>` column are
-recomputed from the live row (tied), everything else from the frozen
-head.
+The head flattens each BF16 chunk to a 2-D GEMM and compiles CE with
+one padded shape; logits for the `<t>` column are recomputed from the
+live row (tied), everything else from the frozen head.
 
 Gradient gate (D9, mandatory before any run): the functional path vs
 a naive reference — per-column sequential bottom slab, separate
 unbatched dual-pass calls, no checkpointing — compared on loss and on
 every surface gradient, against the measured nondeterminism null
 (flash-attn backward uses atomics; even the same path twice is not
-bitwise). Plus an HF cross-check: the parallel span drive with the
+bitwise). A deterministic nonzero output-weight gate activates the
+otherwise-blocked hidden MLP gradients. Plus an HF cross-check: the parallel span drive with the
 row synced into the model must match the plain forward's answer
 logits within kernel noise.
+
+Run mode freezes the base before graph construction, adapts activation
+checkpointing to B*k, overlaps deterministic CPU sampling/tokenization
+through pinned memory, warms every graph outside timing, and writes
+atomic optimizer/RNG-complete checkpoints that resume by step.
 
 Run: python -m recirculated_dot_experiment.train gate|run [flags]
 """
@@ -96,6 +103,8 @@ class Surface(nn.Module):
         d = model.config.hidden_size
         self.dot_id = dot_id
         weight = model.model.embed_tokens.weight
+        if weight.dtype != torch.bfloat16:
+            raise TypeError(f"training requires BF16 model weights, got {weight.dtype}")
         self.row = nn.Parameter(weight[dot_id].detach().clone())
         self.gate = GateMLP(d).to(device=weight.device, dtype=weight.dtype)
 
@@ -719,6 +728,35 @@ class ThinkAdapter:
         return self.logits_from_hidden(hidden)
 
 
+class DotsAdapter:
+    """The matched no-wire span runner with the identical BF16 readout."""
+
+    def __init__(self, model, surface: Surface):
+        self.model, self.surface = model, surface
+
+    @torch.no_grad()
+    def answer_hiddens(self, ids: Tensor, ks: list[int]) -> Tensor:
+        span = (ids[0] == self.surface.dot_id).nonzero()
+        start = int(span[0, 0]) if len(span) else ids.shape[1]
+        if start == ids.shape[1]:
+            raise ValueError("dots eval needs a dot span")
+        h = parallel_outputs(self.model, self.surface, ids, start, ckpt=False)
+        positions = torch.tensor(ks, device=ids.device, dtype=torch.long)
+        return h.index_select(1, positions)
+
+    @torch.no_grad()
+    def logits_from_hidden(self, hidden: Tensor) -> Tensor:
+        return answer_logits_from(self.model, self.surface, hidden.unsqueeze(1))
+
+    @torch.no_grad()
+    def answer_logits(self, ids: Tensor) -> Tensor:
+        span = (ids[0] == self.surface.dot_id).nonzero()
+        start = int(span[0, 0]) if len(span) else ids.shape[1]
+        k = ids.shape[1] - start
+        hidden = self.answer_hiddens(ids, [k])[:, 0]
+        return self.logits_from_hidden(hidden)
+
+
 def reference_outputs(
     model, surface: Surface, ids: Tensor, span_start: int, source: int, dest: int
 ) -> Tensor:
@@ -908,7 +946,9 @@ def gate_mode(args) -> None:
 def evaluate_sweep(model, surface, tok, task, k_set, n, condition, source, dest, batch):
     surface.sync_into(model)
     runner = (
-        ThinkAdapter(model, surface, source, dest) if condition == "dots+wire" else None
+        ThinkAdapter(model, surface, source, dest)
+        if condition == "dots+wire"
+        else DotsAdapter(model, surface)
     )
     instances = tasks.sample(tasks.TASKS[task], n, 0, **tasks.KNOBS[task])
     rows = {
@@ -992,6 +1032,13 @@ def _load_checkpoint(path: str, surface, opt) -> int:
     checkpoint_state = torch.load(path, map_location="cuda", weights_only=False)
     if checkpoint_state.get("version") != 1:
         raise ValueError(f"unsupported checkpoint version in {path}")
+    wrong_dtype = {
+        name: tensor.dtype
+        for name, tensor in checkpoint_state["surface"].items()
+        if tensor.is_floating_point() and tensor.dtype != torch.bfloat16
+    }
+    if wrong_dtype:
+        raise TypeError(f"checkpoint surface is not wholly BF16: {wrong_dtype}")
     surface.load_state_dict(checkpoint_state["surface"], strict=True)
     opt.load_state_dict(checkpoint_state["optimizer"])
     random.setstate(checkpoint_state["python_rng"])

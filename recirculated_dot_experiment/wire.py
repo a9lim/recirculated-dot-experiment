@@ -497,8 +497,8 @@ class RecirculationEngine:
 
     def mix(self, h_s: Tensor, h_d: Tensor, alpha, beta) -> Tensor:
         # Eq. 1 (norm-matched mix). Semantic twin of train._mix — keep
-        # them in sync. Deliberate dtype split: bf16 here (compiled hot
-        # path), fp32 there (gate outputs are fp32 masters).
+        # them in sync. Both inference constants and the adaptive gate's
+        # persistent tensors stay in the model's half precision.
         ratio = h_d.norm(dim=-1, keepdim=True) / h_s.norm(
             dim=-1, keepdim=True
         ).clamp_min(self.cfg.eps)

@@ -226,26 +226,23 @@ the end-to-end speed gate; the latter two were explicitly out of scope.
 **D11 — task serialization and forced-choice eval.** (2026-08-20)
 Sequences are composed in id space and never re-tokenized:
 `[BOS] prompt-ids | think-span → answer`, think span = k×`<unused0>`
-(D8), the `render_cot` trace, or empty; the answer token is never part
-of the eval input — the final think/prompt position predicts it.
+(D8), a tokenizer-native prefix of the `render_cot` trace, or empty;
+the answer token is never part of the eval input — the final
+think/prompt position predicts it.
 Task knobs are pinned so every rendered surface form is a single
 Gemma3 token (reachability runs `nodes=10`; `"10"`/`"11"` split into
-digit pairs). Two consequences, both load-bearing: (i) every
-wire-facing condition has exactly ONE token length per (task, k), so
-the compiled wire keeps one execution shape per cell (measured: s5 105,
-parity 68, reachability 82, threesum 53, +k); (ii) a CoT trace costs
-exactly one token per serial state — the legible topline is
-budget-matched against k dots. Eval is forced-choice over the task's
-label tokens (chance = 1/|labels|), read from the engine's
-`answer_logits` (single-position readout — the same answer-only shape
-D9 pins for training supervision); soft-everywhere, full-vocab
-legality and gold logprob ride along. Wire-off arms run the plain
-flipped-model forward (identical FA2 kernels, D10 addendum),
-length-bucketed for the one ragged case (reachability CoT). Instance
-sets are sampled once per task and shared across all conditions —
-comparisons are paired. Conditions: {none, wire, dots, dots+wire} + a
-`cot` topline; k sweeps the dots conditions only (D4: v0 fixed-k
-teacher-forced; the k-sweep is the money plot).
+digit pairs). Every wire-facing condition therefore has exactly one
+token length per (task, k) (measured prompt lengths: s5 105, parity 68,
+reachability 82, threesum 53, then +k). CoT is one natural
+space-bearing string, not separately tokenized states: its actual
+Gemma token prefix is capped at k and reported, so a budget means
+tokens rather than an incorrectly assumed state count. Eval is
+forced-choice over label tokens (chance = 1/|labels|); soft-everywhere,
+full-vocab legality and gold logprob ride along. Instance sets are
+paired across conditions. Current scope labels are explicit:
+`none`, `full-wire`, `dots`, `dots+full-wire`, `dots+think-wire`, and
+`cot`; D12's untrained null is `dots+think-wire`, while the historical
+D11 result remains identifiable as `dots+full-wire`.
 
 **D12 — training path v0.** (2026-08-21, forks a9-ratified)
 **Think-first** (F1): the think scope trains first — cheapest serial
@@ -264,21 +261,49 @@ computation flows only through the answer term (H2 stays clean).
 Interior prompt positions stay unsupervised (detached hiddens, no
 surface signal). **Mixture is the goal, per-task the benchmark** (F4).
 Defaults: online fresh sampling (train seeds disjoint from the eval
-seed), full-vocab CE. Surface: fp32 masters — the `<t>` row (tied:
+seed), full-vocab CE. Surface: BF16 throughout — the `<t>` row (tied:
 synced into the model embedding for plain-forward arms) + the D2 gate
-MLP, zero-init output layer with logit biases so training starts at
-exactly α=0.1, β=0.9. *D9 amendment:* `flash_attn_with_kvcache` has
-no backward — the training path shares FA2 *kernels* via
-`flash_attn_func` over the functional cat'd cache, not the inference
-custom ops; K/V assembly happens inside the checkpointed layer calls
-so no assembled operand survives the forward. The gradient gate is
+MLP, zero-init output layer with logit biases so training starts near
+α=0.1, β=0.9 at BF16 precision. Gemma RMSNorm retains its model-defined
+FP32 reduction accumulator before returning BF16; there are no FP32
+surface masters or FP32-only readout branches. The gradient gate is
 null-calibrated (flash-attn's backward uses atomics; even the same
-path twice is not bitwise) and paired with an HF cross-check: the
-span drive with the row synced in must match the plain forward's
-answer logits within kernel noise. Recorded limitation: the CoT
+path twice is not bitwise), activates the whole gate with a second
+deterministic nonzero output-weight state, and is paired with an HF
+cross-check. Recorded limitation: the CoT
 topline stays frozen — nothing is trainable under a frozen base, so
 it is the *in-context* legible reference, not a trace-supervised
 ceiling (that would need unfreezing; out of scope).
+
+**D13 — audited CUDA training path.** (2026-08-21) The loader freezes
+the base before any graph exists. Q/K/V and gate/up projections are
+packed once and the original Parameters become disjoint views of that
+storage; prompt prefill, parallel span, and serial layer math share
+regional `torch.compile(fullgraph)` functions. At a recurrent step,
+refresh and first-pass tokens are projected together and attend through
+one differentiable `flash_attn_varlen_func` call with per-branch lengths.
+The persistent functional cache stays piecewise; prefix concatenation
+lives inside non-reentrant checkpoint recomputation, avoiding the
+rejected O(k²) materialized-prefix peak. Checkpoint policy is `auto`:
+retain activations while `B*k <= 2048`, recompute above that measured
+4090 knee. The BF16 LM head flattens to a 2-D GEMM, compiles fused CE,
+uses a 512-row slab, and scratch-pads the final slab to one shape.
+
+Evaluation runs max-k once and reads the selected causal positions for
+every smaller k. This is mathematically the same prefix; FA2 tiling at
+different standalone lengths has the usual BF16 null, so the max-k
+shape is the canonical sweep definition. Trained dots and think-wire
+arms use the identical live-row BF16 readout. Training batches are
+generated deterministically by `(seed, step)` in one bounded worker,
+pinned, and copied nonblocking. Every structural graph, task prompt
+family, and configured eval shape warms before timing; a unique-graph
+audit rejects compilation in a train step. Checkpoints are atomically
+replaced and contain surface, optimizer, completed step, CLI config,
+and Python/Torch/CUDA RNG states. Default checkpoint path is the ignored
+`data/train/surface.pt`; `--resume` continues the addressable schedule.
+Training defaults to B=256 because B=512,k=32 exceeds a 24 GiB 4090;
+the inference/task wire retains its independently ratified B=512
+throughput default.
 
 ## Open
 

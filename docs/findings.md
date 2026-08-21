@@ -314,7 +314,8 @@ are deliberate per-shape compiles, and the default limit hard-aborts
 under fullgraph at the 9th shape (hit mid-grid at parity T=69);
 accidental-recompile protection remains G0's unique-graph audit.
 
-Full untrained grid (4 tasks × {none, wire, dots, dots+wire} + cot,
+Full untrained grid (historical full-scope labels: 4 tasks × {none,
+wire, dots, dots+wire} + cot,
 k ∈ {1,2,4,8,16,32}, n=512, B=512, ~8 min wall including compiles):
 
 - **Accuracy at chance everywhere** — no untrained condition computes
@@ -373,3 +374,68 @@ finite in bf16 and fp16; adaptive-alpha fallback finite; PG19 **-9.00%**
 and C4 **-5.09%** over 100x512 windows. Compilation/capture remained
 outside experiment timing, and both dataset evaluations took 2.13 s with
 zero recompiles.
+
+## Training/task correctness and CUDA pass (2026-08-21)
+
+The Claude training/task implementation received a full contract audit
+before optimization. Eight issues were corrected together: the 340 base
+Parameters are frozen before graph construction; the head is a flattened
+2-D GEMM; D12's untrained think-scope null is explicit and the older
+full-scope arm is separately named; CoT is tokenized as one natural
+space-bearing string; Torch/CUDA seeding and optimizer/RNG-complete atomic
+resume replaced surface-only checkpoints; a perturbed-state gate exercises
+the MLP hidden layers that zero output initialization normally blocks; both
+trained arms use one BF16 live-row readout; and project-owned tests plus
+Ruff are green. Surface row, gate, layer I/O, attention, and readout are
+BF16; only Gemma's specified RMSNorm reduction accumulator remains FP32
+internally before returning BF16.
+
+Seven compatible performance changes landed:
+
+1. `checkpoint=auto` retains activations through `B*k <= 2048` and
+   recomputes above it.
+2. CE flattens to a 512-row full-vocab slab, compiles fullgraph, and pads
+   its tail to one shape.
+3. Evaluation performs one max-k causal run and reads every requested
+   prefix position.
+4. Frozen prompt, parallel span, and recurrent layer math use common
+   packed, tensor-only regional compilation.
+5. Refresh and first-pass branches share one projection and one
+   differentiable FA2-varlen attention call.
+6. Training reuses the inference wire's packed projections; original
+   Parameters are storage views, not duplicate allocations.
+7. A bounded deterministic producer overlaps generation/tokenization
+   with pinned, nonblocking host-to-device transfer.
+
+Paired RTX 4090 evidence against commit `f4b4325`, parity B=64,k=4,
+five warm full train steps (forward + full-vocab loss + backward + AdamW):
+median **290.91 → 98.72 ms (2.95×)**, peak **6.38 → 3.54 GiB
+(−44.5%)**. The baseline accumulated gradients for all 340 base
+Parameters (**1.862 GiB**); the new path accumulated zero. Isolated
+512-row head forward+backward improved **8.42 → 6.63 ms (1.27×)**.
+
+The adaptive checkpoint tradeoff at B=256,k=8 was **662.8 ms / 12.97
+GiB** without recomputation versus **772.3 ms / 4.44 GiB** with it; auto
+therefore takes the 14.2% faster retained path while leaving more than
+10 GiB headroom. At the long default stress point B=256,k=32, the
+piecewise checkpointed path measured **2.47 s / 9.10 GiB**. A rejected
+intermediate that persisted assembled prefixes reached 22.76 GiB; no
+such cache remains.
+
+Max-k evaluation over k={1,2,4,8}, B=64 measured **0.110 s versus 0.330
+s (3.00×)** for four standalone executions. Sweep-vs-standalone mean
+logit differences were 0.047–0.056 for smaller k, inside the established
+BF16 kernel-tiling null; full-vocab top-1 agreed 100%. Natural S5 CoT now
+decodes as `3 3 2 ...` (15 actual tokens for eight states), not `332...`.
+For the heaviest CPU generator (threesum B=256), synchronous preparation
+was 69.4 ms median; after the first fill, the bounded producer's maximum
+observed wait was 18 microseconds behind a 150 ms simulated GPU step.
+
+Final gates: full zero-init and perturbed-gate gradient checks PASS
+(functional/reference losses equal at BF16 resolution; max relative
+gradient differences 2.27e-2 and 5.18e-2), span/HF top-1 1.000 with mean
+|dlogit| 9.42e-2, inference G0 identity PASS at its canonical 5.80e-2 /
+0.9746 / 27.0229→27.0575 measurements, six project tests on Jobe, seven
+shared task tests on both machines, and zero train-step graphs after the
+14-graph structural warmup. Compile/warmup is reported separately and
+excluded from the experiment clock.

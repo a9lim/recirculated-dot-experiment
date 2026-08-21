@@ -8,9 +8,10 @@ space and never re-tokenized:
     [BOS] prompt-ids | think-span  ->  answer     (answer never in ids)
 
 with the think span one of: k copies of <t> := <unused0> (D8), a
-tokenizer-native prefix of the legible render_cot trace, or empty. Answers are the pinned single
-tokens directly after the last think/prompt token (D8: space-free,
-the prompt ends with its own cue token).
+tokenizer-native prefix of the legible render_cot trace, or empty.
+Answers are the pinned single tokens directly after the last
+think/prompt token (D8: space-free, the prompt ends with its own cue
+token).
 
 Task knobs are pinned so every wire-facing condition has ONE token
 length per (task, k): all surface forms (states, node ids, bits, vec
@@ -24,10 +25,10 @@ by length instead.
 Evaluation is forced-choice at the final position: argmax over the
 task's label tokens (chance = 1/|labels|). Soft-everywhere: full-vocab
 legality (does the unrestricted argmax land in the label set) and the
-gold answer's full-vocab logprob ride along. Wire conditions go
-through RecirculationEngine.answer_logits with duplicate-row batch
-padding (discarded); no-wire conditions use the plain flipped-model
-forward with logits_to_keep=1.
+gold answer's full-vocab logprob ride along. Dot sweeps execute max-k
+once and read every causal prefix through matched BF16 heads; full-
+and think-scope wire runners are named separately. Final partial
+batches are duplicate-row padded and discarded before scoring.
 
 Importable on the Mac: the wire's flash-attn hard import is reached
 only from the CLI, which is jobe-only like everything model-facing.
@@ -117,7 +118,7 @@ def encode(tok, inst: Instance, think: str = "none", k: int = 0) -> Encoded:
         if trace is None:
             raise ValueError(f"{inst.task} has no CoT trace")
         trace_ids = tok(trace, add_special_tokens=False).input_ids
-        ids = ids + trace_ids[:k] if k else ids + trace_ids
+        ids += trace_ids[:k] if k else trace_ids
     elif think != "none":
         raise ValueError(f"unknown think mode {think!r}")
     label_ids = tuple(single_token(tok, s) for s in label_space(inst))
@@ -245,7 +246,7 @@ def main() -> None:
     p.add_argument("--ramp", type=int, default=10)
     args = p.parse_args()
 
-    from .train import Surface, ThinkAdapter
+    from .train import DotsAdapter, Surface, ThinkAdapter
     from .wire import RecirculationEngine, WireConfig, load_model
 
     tok, model = load_model(args.model, "cuda")
@@ -255,6 +256,7 @@ def main() -> None:
     )
     dot_id = single_token(tok, DOT)
     surface = Surface(model, dot_id)
+    dots_engine = DotsAdapter(model, surface)
     think_engine = ThinkAdapter(model, surface, args.source, args.dest)
     ks = [int(s) for s in args.k.split(",")]
 
@@ -271,7 +273,7 @@ def main() -> None:
                     k: [encode(tok, inst, think, k) for inst in instances] for k in ks
                 }
                 runner = {
-                    "plain": None,
+                    "plain": dots_engine,
                     "full": full_engine,
                     "think": think_engine,
                 }[scope]
