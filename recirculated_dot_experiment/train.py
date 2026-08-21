@@ -1037,7 +1037,9 @@ def run_mode(args) -> None:
             warm_loss = _forward_loss(
                 model, surface, ids, answers, span_start, args, warm_ckpt
             )[0]
-            torch.autograd.grad(warm_loss, tuple(surface.parameters()))
+            torch.autograd.grad(
+                warm_loss, tuple(surface.parameters()), allow_unused=True
+            )
         if args.eval_every:
             for task_name in task_list:
                 evaluate_sweep(
