@@ -1553,6 +1553,8 @@ def run_mode(args) -> None:
                     print(f"  eval {task_name:12s} acc/legal  {row}")
             if args.save_every and step % args.save_every == 0:
                 _save_checkpoint(args.out, surface, opt, args, step)
+            if args.snapshot_every and step % args.snapshot_every == 0:
+                _save_checkpoint(f"{args.out}.{step}", surface, opt, args, step)
     except KeyboardInterrupt:
         _save_checkpoint(args.out, surface, opt, args, completed_step)
         print(f"interrupted; checkpointed completed step {completed_step}")
@@ -1596,6 +1598,17 @@ def main() -> None:
     p.add_argument("--eval-n", type=int, default=256)
     p.add_argument("--prefetch", type=int, default=2)
     p.add_argument("--save-every", type=int, default=100)
+    p.add_argument(
+        "--snapshot-every",
+        type=int,
+        default=0,
+        help="also keep an immutable checkpoint copy at OUT.STEP every N steps",
+    )
+    p.add_argument(
+        "--knobs",
+        default=None,
+        help="task knob overrides for this run, e.g. 'length=8'",
+    )
     p.add_argument("--out", default="data/train/surface.pt")
     p.add_argument(
         "--resume",
@@ -1604,6 +1617,16 @@ def main() -> None:
         help="resume from PATH, or from --out when passed without PATH",
     )
     args = p.parse_args()
+    if args.knobs:
+        # CLI-scope override of the pinned task knobs (like the recompile
+        # guard above): batches and eval rows in this process see one
+        # consistent knob set, and the checkpoint's args record it.
+        for pair in args.knobs.split(","):
+            key, _, value = pair.partition("=")
+            for task in args.tasks.split(","):
+                if key not in tasks.KNOBS[task]:
+                    raise ValueError(f"{task} has no knob {key!r}")
+                tasks.KNOBS[task][key] = int(value)
     if args.mode == "gate":
         gate_mode(args)
     else:
