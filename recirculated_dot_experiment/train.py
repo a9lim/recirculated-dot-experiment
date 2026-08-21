@@ -1423,15 +1423,16 @@ def run_mode(args) -> None:
     producer = _BatchProducer(tok, args, task_list, k_set, start_step)
     completed_step = start_step - 1
     try:
-        # Cover the distinct structural regimes before the experiment clock:
-        # no pair (k=1), first pair (k=2), dynamic steady prefix (k>=4),
-        # largest activation footprint, and every prompt family. No optimizer
-        # update occurs, and the timed loop rejects any escaped compile.
+        # Warm every configured k before the experiment clock: each k is
+        # shape-distinct somewhere (span length, the execution plan's
+        # microbatch, the dynamic=False head-CE chunk — a [max,1,2,4]
+        # heuristic let k=8's B=256 chunk escape into a timed step), plus
+        # every prompt family. Largest k first (cache-backing canon). No
+        # optimizer update occurs; the timed loop rejects escaped compiles.
         warm_args = argparse.Namespace(**vars(args))
         warm_args.seed = args.seed + 97_531
         warm_args.batch = args.batch
-        structural = [max(k_set), 1, 2, 4]
-        structural = [min(k_set, key=lambda value: abs(value - k)) for k in structural]
+        structural = sorted(set(k_set), reverse=True)
         warm_cases = [(task_list[0], k) for k in structural]
         warm_cases.extend((task, structural[-1]) for task in task_list)
         warm_cases = list(dict.fromkeys(warm_cases))

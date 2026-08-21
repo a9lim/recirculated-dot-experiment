@@ -302,10 +302,12 @@ alternatives, and the paths not taken are in the journal.
   compile, FA2-varlen dual branch, `checkpoint=auto` knees, max-k
   sweep eval, warm-everything + zero-compile-in-step, atomic
   RNG-complete resume; whole-step CUDA graphs rejected.
+- **D14** Free-running eval is a derived readout on the max-k sweep
+  (content-free dots make the rollout prefix deterministic): greedy
+  halt plus the closed-form sampled-halting marginal; non-halt within
+  budget is a recorded outcome; dot arms only, CoT stays forced.
 
 ## Open
 
 - Reachability negatives are unconstrained; if shortcut heuristics
   show up in the 2×2, add near-miss negatives to the shared module.
-- Adaptive-k evaluation (sampled halting at inference) once a trained
-  surface exists — the stopping hazard is already trained in v0.

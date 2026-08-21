@@ -186,6 +186,31 @@ def evaluate(
     return {key: value / n for key, value in sums.items()} | {"n": n}
 
 
+def _sweep_hiddens(model, runner, ids: torch.Tensor, ks: list[int], start: int):
+    """Hiddens at the answer position of every requested dot budget,
+    from one max-k causal forward. A runner supplies
+    ``answer_hiddens(ids, ks)``; without one, ordinary HF hidden states
+    implement the dots-only arm."""
+    if runner is not None:
+        return runner.answer_hiddens(ids, ks)
+    hidden = model.model(input_ids=ids, use_cache=False).last_hidden_state
+    positions = torch.tensor(
+        [start + k - 1 for k in ks], device=ids.device, dtype=torch.long
+    )
+    return hidden.index_select(1, positions)
+
+
+def _position_logits(model, runner, hidden: torch.Tensor) -> torch.Tensor:
+    """Full-vocab logits for one selected position's hiddens."""
+    if runner is not None:
+        return runner.logits_from_hidden(hidden)
+    logits = model.lm_head(hidden)
+    softcap = getattr(model.config, "final_logit_softcapping", None)
+    if softcap is not None:
+        logits = torch.tanh(logits / softcap) * softcap
+    return logits
+
+
 @torch.inference_mode()
 def evaluate_dot_sweep(
     model,
@@ -193,12 +218,7 @@ def evaluate_dot_sweep(
     runner=None,
     batch: int = 512,
 ) -> dict[int, dict[str, float]]:
-    """Score every k from one exact max-k causal forward per batch.
-
-    A runner supplies ``answer_hiddens(ids, ks)`` and
-    ``logits_from_hidden(hidden)``. Without one, ordinary HF hidden states
-    and its tied head implement the dots-only arm.
-    """
+    """Score every k from one exact max-k causal forward per batch."""
     ks = sorted(encoded)
     if not ks or ks[0] < 1:
         raise ValueError("dot sweeps require positive k")
@@ -213,28 +233,97 @@ def evaluate_dot_sweep(
         group_max = max_rows[i : i + batch]
         padded = group_max + [group_max[0]] * (batch - len(group_max))
         ids = torch.tensor([row.ids for row in padded], device=device)
-        if runner is None:
-            hidden_all = model.model(input_ids=ids, use_cache=False).last_hidden_state
-            start = group_max[0].think[0]
-            positions = torch.tensor(
-                [start + k - 1 for k in ks], device=device, dtype=torch.long
-            )
-            hidden = hidden_all.index_select(1, positions)
-        else:
-            hidden = runner.answer_hiddens(ids, ks)
+        hidden = _sweep_hiddens(model, runner, ids, ks, group_max[0].think[0])
         for j, k in enumerate(ks):
-            if runner is None:
-                logits = model.lm_head(hidden[:, j])
-                softcap = getattr(model.config, "final_logit_softcapping", None)
-                if softcap is not None:
-                    logits = torch.tanh(logits / softcap) * softcap
-            else:
-                logits = runner.logits_from_hidden(hidden[:, j])
+            logits = _position_logits(model, runner, hidden[:, j])
             _score(logits, encoded[k][i : i + batch], sums[k])
     return {
         k: {key: value / sums[k]["n"] for key, value in sums[k].items() if key != "n"}
         | {"n": sums[k]["n"]}
         for k in ks
+    }
+
+
+@torch.inference_mode()
+def evaluate_free_running(
+    model, encoded: list[Encoded], runner=None, batch: int = 512
+) -> dict[str, float]:
+    """Free-running readout derived from the max-k rows (design.md D14).
+
+    Content-free identical dots make a free rollout's prefix equal the
+    teacher-forced one, so halting needs no generation loop — everything
+    reads off the max-k run's per-position full-vocab logits. Greedy:
+    halt at the first position whose unrestricted argmax is not `<t>`
+    and score the emitted token; a row that never halts inside the
+    budget counts against `halt` and scores zero. Soft: the exact
+    sampled-halting marginal — P(halt at t) = (1-p_t(dot))·prod_{s<t}
+    p_s(dot) — with the unconditional mass on emitting the gold
+    (`p_gold`) or any legal (`p_legal`) token as the halting token.
+    `k_halt`/`k_soft` are mean halt positions conditional on halting.
+    """
+    spans = {e.think for e in encoded}
+    if len(spans) != 1:
+        raise ValueError(f"free running needs one think span, got {sorted(spans)}")
+    ((start, end),) = spans
+    k = end - start
+    if k < 1:
+        raise ValueError("free running needs a dot span")
+    dot_id = encoded[0].ids[start]
+    if set(encoded[0].ids[start:end]) != {dot_id}:
+        raise ValueError("free running is defined for dot spans only")
+    device = next(model.parameters()).device
+    keys = ("halt", "acc", "legal", "k_halt", "p_halt", "p_gold", "p_legal", "k_soft")
+    sums = dict.fromkeys(keys, 0.0)
+    n = 0
+    for i in range(0, len(encoded), batch):
+        group = encoded[i : i + batch]
+        padded = group + [group[0]] * (batch - len(group))
+        ids = torch.tensor([row.ids for row in padded], device=device)
+        hidden = _sweep_hiddens(model, runner, ids, list(range(1, k + 1)), start)
+        m = len(group)
+        answers = torch.tensor([e.answer for e in group], device=device)
+        label_ids = torch.tensor(group[0].label_ids, device=device)
+        active = torch.ones(m, dtype=torch.bool, device=device)
+        halt_pos = torch.zeros(m, dtype=torch.long, device=device)
+        emitted = torch.full((m,), dot_id, dtype=torch.long, device=device)
+        cum = torch.zeros(m, device=device)  # log prod_{s<t} p_s(dot)
+        masses = [torch.zeros(m, device=device) for _ in range(4)]
+        halt_mass, gold_mass, legal_mass, t_mass = masses
+        for j in range(k):
+            logits = _position_logits(model, runner, hidden[:, j])[:m]
+            argmax = logits.argmax(-1)
+            newly = active & (argmax != dot_id)
+            halt_pos = torch.where(newly, j + 1, halt_pos)
+            emitted = torch.where(newly, argmax, emitted)
+            active = active & ~newly
+            lp = logits.float().log_softmax(-1)
+            stay = cum + lp[:, dot_id]
+            mass = cum.exp() - stay.exp()
+            halt_mass += mass
+            t_mass += (j + 1) * mass
+            gold_mass += (cum + lp.gather(-1, answers.unsqueeze(-1)).squeeze(-1)).exp()
+            legal_mass += (cum + lp[:, label_ids].logsumexp(-1)).exp()
+            cum = stay
+        halted = ~active
+        sums["halt"] += halted.sum().item()
+        sums["acc"] += (halted & (emitted == answers)).sum().item()
+        sums["legal"] += (halted & torch.isin(emitted, label_ids)).sum().item()
+        sums["k_halt"] += halt_pos[halted].sum().item()
+        sums["p_halt"] += halt_mass.sum().item()
+        sums["p_gold"] += gold_mass.sum().item()
+        sums["p_legal"] += legal_mass.sum().item()
+        sums["k_soft"] += t_mass.sum().item()
+        n += m
+    return {
+        "halt": sums["halt"] / n,
+        "acc": sums["acc"] / n,
+        "legal": sums["legal"] / n,
+        "k_halt": sums["k_halt"] / max(sums["halt"], 1.0),
+        "p_halt": sums["p_halt"] / n,
+        "p_gold": sums["p_gold"] / n,
+        "p_legal": sums["p_legal"] / n,
+        "k_soft": sums["k_soft"] / max(sums["p_halt"], 1e-12),
+        "n": n,
     }
 
 
