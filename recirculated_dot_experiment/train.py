@@ -340,6 +340,22 @@ def _dual_layer_math(
 
 _single_layer_c = torch.compile(_single_layer_math, fullgraph=True, dynamic=True)
 _dual_layer_c = torch.compile(_dual_layer_math, fullgraph=True, dynamic=True)
+_final_norm_c = torch.compile(_rms_norm, fullgraph=True, dynamic=True)
+
+
+def _finish_outputs_math(
+    prompt_hidden: Tensor,
+    dot_hidden: Tensor,
+    norm_weight: Tensor,
+    eps: float,
+) -> Tensor:
+    return torch.cat(
+        (prompt_hidden, _rms_norm(dot_hidden, norm_weight, eps)),
+        dim=1,
+    )
+
+
+_finish_outputs_c = torch.compile(_finish_outputs_math, fullgraph=True, dynamic=True)
 
 
 def _dual_layer_from_pieces(
@@ -455,7 +471,7 @@ def _prompt_prefill(model, packed, prompt_ids: Tensor):
             True,
         )
         kv.append((k, v))
-    return model.model.norm(x[:, -1:]), kv
+    return _final_norm_c(x[:, -1:], model.model.norm.weight, model.model.norm.eps), kv
 
 
 @dataclass
@@ -741,7 +757,12 @@ def think_outputs(
         frontier = {i: first_kv[j] for j, i in enumerate(slab)}
         tops.append(x1)
         h_s_prev = h_s
-    return torch.cat([h_init, model.model.norm(torch.cat(tops, dim=1))], dim=1)
+    return _finish_outputs_c(
+        h_init,
+        torch.cat(tops, dim=1),
+        model.model.norm.weight,
+        model.model.norm.eps,
+    )
 
 
 def parallel_outputs(
@@ -777,7 +798,12 @@ def parallel_outputs(
         model.config.num_hidden_layers,
         ckpt,
     )
-    return torch.cat([h_init, model.model.norm(x)], dim=1)
+    return _finish_outputs_c(
+        h_init,
+        x,
+        model.model.norm.weight,
+        model.model.norm.eps,
+    )
 
 
 def _head_ce_chunk(W, row, dot_id, softcap, h, targets):
@@ -850,16 +876,29 @@ def span_loss(
     return ce_ans + lam * ce_emit, ce_ans, ce_emit
 
 
+def _answer_logits_math(W, row, dot_id, softcap, hidden):
+    logits = F.linear(hidden, W)
+    dot = F.linear(hidden, row.unsqueeze(0))
+    column = torch.full(
+        (hidden.shape[0], 1), dot_id, dtype=torch.long, device=hidden.device
+    )
+    logits = logits.scatter(-1, column, dot)
+    return torch.tanh(logits / softcap) * softcap if softcap is not None else logits
+
+
+_answer_logits_c = torch.compile(_answer_logits_math, fullgraph=True, dynamic=True)
+
+
 def answer_logits_from(model, surface: Surface, hiddens: Tensor) -> Tensor:
     hidden = hiddens[:, -1]
-    lg = F.linear(hidden, model.lm_head.weight)
-    dot = F.linear(hidden, surface.row.unsqueeze(0))
-    column = torch.full(
-        (hidden.shape[0], 1), surface.dot_id, dtype=torch.long, device=hidden.device
-    )
-    lg = lg.scatter(-1, column, dot)
     softcap = getattr(model.config, "final_logit_softcapping", None)
-    return torch.tanh(lg / softcap) * softcap if softcap is not None else lg
+    return _answer_logits_c(
+        model.lm_head.weight,
+        surface.row,
+        surface.dot_id,
+        softcap,
+        hidden,
+    )
 
 
 class ThinkAdapter:
@@ -1384,9 +1423,7 @@ def run_mode(args) -> None:
     tok, model = load_model(args.model, "cuda")
     dot_id = tasks.single_token(tok, tasks.DOT)
     surface = Surface(model, dot_id).cuda()
-    opt = torch.optim.AdamW(
-        surface.parameters(), lr=args.lr, weight_decay=0.0, fused=True
-    )
+    opt = torch.optim.AdamW(surface.parameters(), lr=args.lr, weight_decay=0.0)
     task_list = args.tasks.split(",")
     k_set = [int(s) for s in args.k.split(",")]
     eval_runner = None
