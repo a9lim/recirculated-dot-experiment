@@ -110,6 +110,59 @@ def _clone_packed_state_dict_views(module, state_dict, prefix, local_metadata) -
             state_dict[key] = state_dict[key].clone()
 
 
+def _pack_parameter_family(parameters) -> Tensor:
+    """Pack output rows and make the original Parameters disjoint views."""
+    packed = torch.cat([parameter.detach() for parameter in parameters], dim=0)
+    packed = packed.contiguous()
+    sizes = [parameter.shape[0] for parameter in parameters]
+    for parameter, view in zip(parameters, packed.split(sizes, dim=0), strict=True):
+        parameter.data = view
+    return packed
+
+
+def pack_model_projections(model) -> tuple[tuple, tuple, tuple]:
+    """Pack frozen QKV and gate/up projections once, preserving originals.
+
+    The inference engine and differentiable training path share this storage.
+    Original Parameters remain valid disjoint views, so ordinary HF forwards
+    and strict loads keep working without retaining duplicate weights.
+    """
+    cached = getattr(model, "_wire_packed_projections", None)
+    if cached is not None:
+        return cached
+
+    qkv_weights, qkv_biases, gate_up_weights = [], [], []
+    aliased_parameters = []
+    for layer in model.model.layers:
+        attn = layer.self_attn
+        weights = (attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight)
+        qkv_weights.append(_pack_parameter_family(weights))
+        aliased_parameters.extend(weights)
+        biases = (attn.q_proj.bias, attn.k_proj.bias, attn.v_proj.bias)
+        if any(bias is None for bias in biases):
+            if not all(bias is None for bias in biases):
+                raise ValueError("Q/K/V projections must agree on bias presence")
+            qkv_biases.append(None)
+        else:
+            qkv_biases.append(_pack_parameter_family(biases))
+            aliased_parameters.extend(biases)
+        gate_up = (layer.mlp.gate_proj.weight, layer.mlp.up_proj.weight)
+        gate_up_weights.append(_pack_parameter_family(gate_up))
+        aliased_parameters.extend(gate_up)
+
+    parameter_names = {id(p): name for name, p in model.named_parameters()}
+    keys = {parameter_names[id(p)] for p in aliased_parameters}
+    if not hasattr(model, "_wire_packed_state_dict_keys"):
+        model._wire_packed_state_dict_keys = set()
+        model._wire_packed_state_dict_hook = model.register_state_dict_post_hook(
+            _clone_packed_state_dict_views
+        )
+    model._wire_packed_state_dict_keys.update(keys)
+    packed = (tuple(qkv_weights), tuple(qkv_biases), tuple(gate_up_weights))
+    model._wire_packed_projections = packed
+    return packed
+
+
 @torch.library.custom_op("wire::fa2_prefill", mutates_args=())
 def _fa2_prefill_op(q: Tensor, k: Tensor, v: Tensor, scale: float) -> Tensor:
     """Traceable, maskless causal FA2 prefill for the <=window wire."""
@@ -273,7 +326,7 @@ def load_model(name: str = "google/gemma-3-1b-pt", device: str = "cuda"):
     model = AutoModelForCausalLM.from_pretrained(
         name, dtype=torch.bfloat16, attn_implementation="wire_attention"
     )
-    model.to(device).eval()
+    model.to(device).eval().requires_grad_(False)
     return tok, model
 
 
@@ -410,7 +463,11 @@ class RecirculationEngine:
         self._cache: BranchCache | None = None
         self._rope: dict[str, tuple[Tensor, Tensor]] | None = None
         self._steady_graph: torch.cuda.CUDAGraph | None = None
-        self._build_packed_weights()
+        (
+            self._qkv_weights,
+            self._qkv_biases,
+            self._gate_up_weights,
+        ) = pack_model_projections(model)
 
         # Compile every tensor-heavy region. The outer position loop remains
         # the small state machine that advances views into the mutable cache.
@@ -421,52 +478,6 @@ class RecirculationEngine:
         self._nll_chunk_c = torch.compile(self._nll_chunk, **compile_kw)
         self._logits_chunk_c = torch.compile(self._logits_chunk, **compile_kw)
         self._nll_from_logits_c = torch.compile(self._nll_from_logits, **compile_kw)
-
-    @staticmethod
-    def _pack_parameter_family(parameters) -> Tensor:
-        """Pack along output rows and make each Parameter a disjoint view."""
-        packed = torch.cat([p.detach() for p in parameters], dim=0).contiguous()
-        for parameter, view in zip(
-            parameters, packed.split([p.shape[0] for p in parameters], dim=0)
-        ):
-            parameter.data = view
-        return packed
-
-    def _build_packed_weights(self) -> None:
-        """Pack frozen projections and retire their duplicate original storage."""
-        qkv_weights, qkv_biases, gate_up_weights = [], [], []
-        aliased_parameters = []
-        for layer in self.layers:
-            attn = layer.self_attn
-            weights = (attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight)
-            qkv_weights.append(self._pack_parameter_family(weights))
-            aliased_parameters.extend(weights)
-            biases = (attn.q_proj.bias, attn.k_proj.bias, attn.v_proj.bias)
-            if any(bias is None for bias in biases):
-                if not all(bias is None for bias in biases):
-                    raise ValueError("Q/K/V projections must agree on bias presence")
-                qkv_biases.append(None)
-            else:
-                qkv_biases.append(self._pack_parameter_family(biases))
-                aliased_parameters.extend(biases)
-            gate_up = (layer.mlp.gate_proj.weight, layer.mlp.up_proj.weight)
-            gate_up_weights.append(self._pack_parameter_family(gate_up))
-            aliased_parameters.extend(gate_up)
-        self._qkv_weights = tuple(qkv_weights)
-        self._qkv_biases = tuple(qkv_biases)
-        self._gate_up_weights = tuple(gate_up_weights)
-
-        # Safetensors rejects shared backing storage even when views are
-        # disjoint. Clone only while producing a state_dict; the live model
-        # keeps the packed aliases, and load_state_dict writes through them.
-        parameter_names = {id(p): name for name, p in self.model.named_parameters()}
-        keys = {parameter_names[id(p)] for p in aliased_parameters}
-        if not hasattr(self.model, "_wire_packed_state_dict_keys"):
-            self.model._wire_packed_state_dict_keys = set()
-            self.model._wire_packed_state_dict_hook = (
-                self.model.register_state_dict_post_hook(_clone_packed_state_dict_views)
-            )
-        self.model._wire_packed_state_dict_keys.update(keys)
 
     def _ensure_rope(
         self, dtype: torch.dtype, device: torch.device
@@ -766,9 +777,7 @@ class RecirculationEngine:
             # keys and layout, so Dynamo retains one prefill graph even
             # when B is not divisible by 64.
             ids = input_ids.index_select(0, cache.prefill_rows[chunk_index])
-            prefill = self._prefill_c(
-                ids, cf[:, :T], sf[:, :T], cs[:, :T], ss[:, :T]
-            )
+            prefill = self._prefill_c(ids, cf[:, :T], sf[:, :T], cs[:, :T], ss[:, :T])
             h_dest[start : start + valid].copy_(prefill[:valid])
 
         # Serial slab: layers dest+1..top, batched dual pass. The compiled
@@ -884,6 +893,23 @@ class RecirculationEngine:
     def teacher_forced_logits(self, input_ids: Tensor, alpha_fn=None) -> Tensor:
         """First-pass logits [B, T, V]; small T only (full-vocab memory)."""
         return self.teacher_forced(input_ids, alpha_fn, return_logits=True)[1]
+
+    @torch.inference_mode()
+    def answer_hiddens(self, input_ids: Tensor, ks: list[int]) -> Tensor:
+        """Raw top states for several dot budgets from one max-k run."""
+        if not ks or min(ks) < 1:
+            raise ValueError("answer_hiddens requires positive dot budgets")
+        start = input_ids.shape[1] - max(ks)
+        positions = torch.tensor(
+            [start + k - 1 for k in ks], device=input_ids.device, dtype=torch.long
+        )
+        cache = self._run(input_ids, None)
+        return cache.tops.index_select(1, positions).clone()
+
+    @torch.inference_mode()
+    def logits_from_hidden(self, hidden: Tensor) -> Tensor:
+        """Compiled BF16 head for a raw top state returned by a sweep."""
+        return self._logits_chunk_c(hidden.unsqueeze(1)).squeeze(1)
 
     @torch.inference_mode()
     def answer_logits(self, input_ids: Tensor, alpha_fn=None) -> Tensor:
