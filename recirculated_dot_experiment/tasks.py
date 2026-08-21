@@ -258,9 +258,7 @@ def main() -> None:
     surface = Surface(model, dot_id)
     prompt_cache = PromptStateCache(model)
     dots_engine = DotsAdapter(model, surface, prompt_cache)
-    think_engine = ThinkAdapter(
-        model, surface, args.source, args.dest, prompt_cache
-    )
+    think_engine = ThinkAdapter(model, surface, args.source, args.dest, prompt_cache)
     ks = [int(s) for s in args.k.split(",")]
 
     for task in args.tasks.split(","):

@@ -417,7 +417,7 @@ Parameters (**1.862 GiB**); the new path accumulated zero. Isolated
 The adaptive checkpoint tradeoff at B=256,k=8 was **531.0 ms / 13.05
 GiB** without recomputation versus **619.5 ms / 5.52 GiB** with it; auto
 therefore takes the 16.7% faster retained path while leaving more than
-10 GiB headroom. At the long default stress point B=256,k=32, the
+10 GiB headroom. At the then-default stress point B=256,k=32, the
 piecewise checkpointed path measured **2.32 s / 10.17 GiB**. A rejected
 intermediate that persisted assembled prefixes reached 22.76 GiB; no
 such cache remains.
@@ -439,3 +439,48 @@ gradient differences 2.27e-2 and 5.18e-2), span/HF top-1 1.000 with mean
 shared task tests on both machines, and zero train-step graphs after the
 15-graph structural warmup. Compile/warmup is reported separately and
 excluded from the experiment clock.
+
+## Training/task throughput follow-up (2026-08-21)
+
+Five remaining opportunities were timed on the RTX 4090. Four produced a
+useful canonical change; manual whole-step CUDA graphs did not.
+
+1. **K-aware effective batches.** Training now defaults to effective B=512.
+   For k=8, auto mode runs two retained B=256 microbatches: **1.0611 s,
+   482.5 examples/s, 13.09 GiB**. One checkpointed B=512 step was **1.1789 s,
+   434.3 examples/s, 9.07 GiB**, so the equal-shape accumulation is 11.1%
+   faster. For k=16 and k=32, the larger checkpointed GEMMs win: B=512
+   measured **2.0674 s / 247.7 examples/s / 11.58 GiB** and **4.0650 s /
+   126.0 examples/s / 17.82 GiB**. B=640,k=32 reached 21.77 GiB with no
+   throughput gain (125.0 examples/s), fixing B=512 as the long-k knee.
+2. **Selective activation checkpointing.** At B=512,k=16, retaining four
+   evenly spaced recurrent layers and checkpointing 22 improved **2.0674 →
+   2.0286 s (1.9%)**, at **18.00 GiB**. Retaining eight layers OOMed. At
+   k=32, retaining even one recurrent layer OOMed once the compiled head was
+   live, so the safe all-layer plan remains authoritative. Checkpoint calls
+   no longer preserve CUDA RNG state because the captured region contains no
+   stochastic operation.
+3. **Compiled adaptive surface.** Gate MLP, sigmoid alpha/beta, norm-matched
+   mixing, final RMSNorm, packed decoder math, and train CE are now regional
+   fullgraph compilations. Gate/mix was whole-step neutral at B=256,k=8
+   (**530.4 ms compiled vs 531.6 ms eager**) but eliminates the last material
+   trainable pointwise island; the mandatory zero-init and perturbed-surface
+   gradient gate still passes. Compiling the standalone eval readout was
+   rejected (**3.535 vs 3.517 ms**) and fused AdamW was also rejected for this
+   small parameter list (**0.283 vs 0.112 ms**).
+4. **Frozen prompt-state cache.** Repeated task evaluations share a bounded
+   packed BF16 pinned-host LRU. On parity B=256, its entry is 0.432 GiB. After
+   warming both tensor layouts outside timing, a compiled k=32 sweep segment
+   fell from **435.4 to 295.1 ms (1.48×; 140.3 ms saved)** with bitwise-equal
+   hiddens. The single packed transfer avoids 53 separate CUDA allocations.
+
+Manual forward+backward CUDA graphs helped the old small B=64,k=4 shape
+(**97.55 → 90.87 ms, 1.07×**), but not the throughput contract: B=512,k=4
+improved only **0.35%**, B=256,k=8 **1.06%**, and selective B=512,k=16
+**0.81%**, while reserving **14.82, 15.23, and 20.34 GiB** respectively in
+private graph pools. Persisting one graph per task/shape would consume the
+memory needed by other shapes; shared pools impose output-lifetime and replay
+ordering constraints disproportionate to the measured gain. The manual graph
+path was therefore not implemented. Profiler attribution (42.9% GEMM, 30.8%
+FA2 backward; task heads 3.0% of max-k evaluation) likewise gave no case for
+installing an external kernel package.

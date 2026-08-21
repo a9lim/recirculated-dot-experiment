@@ -116,9 +116,9 @@ def _gate_mix_math(
     x = F.gelu(F.linear(x, h1_weight, h1_bias))
     x = F.gelu(F.linear(x, h2_weight, h2_bias))
     alpha, beta = torch.sigmoid(F.linear(x, out_weight, out_bias)).chunk(2, dim=-1)
-    ratio = h_d.norm(dim=-1, keepdim=True) / h_s.norm(
-        dim=-1, keepdim=True
-    ).clamp_min(cfg_eps)
+    ratio = h_d.norm(dim=-1, keepdim=True) / h_s.norm(dim=-1, keepdim=True).clamp_min(
+        cfg_eps
+    )
     return beta * h_d + alpha * ratio * h_s
 
 
@@ -555,7 +555,9 @@ class PromptStateCache:
             self.stream.wait_stream(current)
             offset = 0
             for size, tensor in zip(sizes, source):
-                host.narrow(0, offset, size).copy_(tensor.reshape(-1), non_blocking=True)
+                host.narrow(0, offset, size).copy_(
+                    tensor.reshape(-1), non_blocking=True
+                )
                 tensor.record_stream(self.stream)
                 offset += size
             ready = self.stream.record_event()
@@ -876,29 +878,16 @@ def span_loss(
     return ce_ans + lam * ce_emit, ce_ans, ce_emit
 
 
-def _answer_logits_math(W, row, dot_id, softcap, hidden):
-    logits = F.linear(hidden, W)
-    dot = F.linear(hidden, row.unsqueeze(0))
-    column = torch.full(
-        (hidden.shape[0], 1), dot_id, dtype=torch.long, device=hidden.device
-    )
-    logits = logits.scatter(-1, column, dot)
-    return torch.tanh(logits / softcap) * softcap if softcap is not None else logits
-
-
-_answer_logits_c = torch.compile(_answer_logits_math, fullgraph=True, dynamic=True)
-
-
 def answer_logits_from(model, surface: Surface, hiddens: Tensor) -> Tensor:
     hidden = hiddens[:, -1]
-    softcap = getattr(model.config, "final_logit_softcapping", None)
-    return _answer_logits_c(
-        model.lm_head.weight,
-        surface.row,
-        surface.dot_id,
-        softcap,
-        hidden,
+    logits = F.linear(hidden, model.lm_head.weight)
+    dot = F.linear(hidden, surface.row.unsqueeze(0))
+    column = torch.full(
+        (hidden.shape[0], 1), surface.dot_id, dtype=torch.long, device=hidden.device
     )
+    logits = logits.scatter(-1, column, dot)
+    softcap = getattr(model.config, "final_logit_softcapping", None)
+    return torch.tanh(logits / softcap) * softcap if softcap is not None else logits
 
 
 class ThinkAdapter:
@@ -1407,8 +1396,10 @@ def _run_microbatches(
         else:
             torch.autograd.grad(scaled_loss, params, allow_unused=True)
         weighted = tuple(value.detach() * fraction for value in values)
-        metrics = weighted if metrics is None else tuple(
-            old + new for old, new in zip(metrics, weighted)
+        metrics = (
+            weighted
+            if metrics is None
+            else tuple(old + new for old, new in zip(metrics, weighted))
         )
     assert metrics is not None
     return metrics

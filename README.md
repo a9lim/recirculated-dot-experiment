@@ -28,9 +28,10 @@ python -m recirculated_dot_experiment.train run --resume
 python -m recirculated_dot_experiment.tasks
 ```
 
-Training defaults to BF16 B=256 with adaptive checkpointing, overlapped
-input preparation, compile warmup outside timing, and atomic resumable
-state at `data/train/surface.pt`. Task scope labels distinguish
+Training defaults to an effective BF16 B=512 with k-aware equal-shape
+microbatching, selective checkpointing, overlapped input preparation,
+and compile/cache warmup outside timing. Atomic resumable state lives at
+`data/train/surface.pt`. Task scope labels distinguish
 `dots+think-wire` (the D12 null) from historical `dots+full-wire`.
 
 ## License

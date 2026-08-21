@@ -279,15 +279,20 @@ ceiling (that would need unfreezing; out of scope).
 the base before any graph exists. Q/K/V and gate/up projections are
 packed once and the original Parameters become disjoint views of that
 storage; prompt prefill, parallel span, and serial layer math share
-regional `torch.compile(fullgraph)` functions. At a recurrent step,
+regional `torch.compile(fullgraph)` functions. The adaptive gate/mix and
+final Gemma norm are tensor-only compiled regions as well. At a recurrent step,
 refresh and first-pass tokens are projected together and attend through
 one differentiable `flash_attn_varlen_func` call with per-branch lengths.
 The persistent functional cache stays piecewise; prefix concatenation
-lives inside non-reentrant checkpoint recomputation, avoiding the
+lives inside non-reentrant checkpoint recomputation with RNG preservation
+disabled (the path is deterministic), avoiding the
 rejected O(k²) materialized-prefix peak. Checkpoint policy is `auto`:
-retain activations while `B*k <= 2048`, recompute above that measured
-4090 knee. The BF16 LM head flattens to a 2-D GEMM, compiles fused CE,
-uses a 512-row slab, and scratch-pads the final slab to one shape.
+`--batch` is the effective optimizer batch; retain activations in equal-shape
+microbatches while `B*k <= 2048`, then prefer the full effective batch with
+recomputation at long k. At the canonical B=512, k=16 plan, four evenly
+spaced recurrent layers retain activations and the other 22 recompute; k=32
+recomputes every layer. The BF16 LM head flattens to a 2-D GEMM, compiles
+fused CE, uses a 512-row slab, and scratch-pads the final slab to one shape.
 
 Evaluation runs max-k once and reads the selected causal positions for
 every smaller k. This is mathematically the same prefix; FA2 tiling at
@@ -297,13 +302,18 @@ arms use the identical live-row BF16 readout. Training batches are
 generated deterministically by `(seed, step)` in one bounded worker,
 pinned, and copied nonblocking. Every structural graph, task prompt
 family, and configured eval shape warms before timing; a unique-graph
-audit rejects compilation in a train step. Checkpoints are atomically
+audit rejects compilation in a train step. Repeated evaluation stores the
+frozen prompt hidden/KV state in a bounded, packed, pinned-host LRU. Its
+one-time D2H fill overlaps the serial dot steps, and both the miss and restored
+view layouts warm before the experiment clock. Checkpoints are atomically
 replaced and contain surface, optimizer, completed step, CLI config,
 and Python/Torch/CUDA RNG states. Default checkpoint path is the ignored
 `data/train/surface.pt`; `--resume` continues the addressable schedule.
-Training defaults to B=256 because B=512,k=32 exceeds a 24 GiB 4090;
-the inference/task wire retains its independently ratified B=512
-throughput default.
+Training and inference/task evaluation both default to B=512. The former is
+an effective batch: k=8 executes as B=256×2, while k=16/32 executes directly
+at B=512. Manual whole-step CUDA graphs are not part of the contract: at
+these throughput shapes they save at most about 1% while pinning 15–20 GiB
+of private graph-pool memory.
 
 ## Open
 

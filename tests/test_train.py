@@ -8,6 +8,7 @@ pytest.importorskip("flash_attn")
 
 from recirculated_dot_experiment.train import (
     GateMLP,
+    PromptStateCache,
     Surface,
     _checkpoint_for,
     _execution_plan,
@@ -67,6 +68,32 @@ def test_tensor_gate_mix_matches_module_path_and_gradients():
     assert all(
         torch.equal(want, parameter.grad)
         for want, parameter in zip(expected_grads, gate.parameters())
+    )
+
+
+def test_prompt_cache_packed_views_restore_state_without_copies():
+    hidden = torch.arange(12, dtype=torch.bfloat16).view(2, 1, 6)
+    kv = [
+        (
+            torch.arange(16, dtype=torch.bfloat16).view(2, 2, 2, 2),
+            torch.arange(16, 32, dtype=torch.bfloat16).view(2, 2, 2, 2),
+        ),
+        (
+            torch.arange(32, 48, dtype=torch.bfloat16).view(2, 2, 2, 2),
+            torch.arange(48, 64, dtype=torch.bfloat16).view(2, 2, 2, 2),
+        ),
+    ]
+    flat = PromptStateCache._flatten((hidden, kv))
+    packed = torch.cat([tensor.reshape(-1) for tensor in flat])
+    restored_hidden, restored_kv = PromptStateCache._views(
+        packed, tuple(tensor.shape for tensor in flat)
+    )
+    restored = PromptStateCache._flatten((restored_hidden, restored_kv))
+
+    assert all(torch.equal(before, after) for before, after in zip(flat, restored))
+    assert all(
+        after.untyped_storage().data_ptr() == packed.untyped_storage().data_ptr()
+        for after in restored
     )
 
 
