@@ -1,8 +1,13 @@
 # Design
 
-Decisions ledger. One dated entry per decision, rationale in one line.
-Anti-cruft clause: the package holds exactly three modules — `wire`,
-`tasks`, `train` — until something concrete forces a fourth.
+The authoritative current state: idea, architecture, task design,
+training recipe, gates, and the decision register (stable D-numbers,
+cited from code). History, superseded detail, and the story of how
+each piece got here live in [journal.md](journal.md); measurements in
+[findings.md](findings.md). Anti-cruft clause: the package holds
+exactly three modules — `wire`, `tasks`, `train` — until something
+concrete forces a fourth (`g0` is the wire's gate runner, not a
+module).
 
 ## Idea
 
@@ -31,7 +36,7 @@ layers dest→source; the dot count is the unrolled time axis.
 - **H2 (learnability).** BPTT through the wire gives answer-only
   supervision a credit-assignment path into the dot span — no CoT
   decomposition data, no coconut curriculum. (Fallback: curriculum;
-  see D6 lesson.)
+  see D6.)
 - **H3 (naturalness).** The minimal trainable surface — one embedding
   row plus a gating MLP, base frozen — suffices; the model's own
   circuits do the compute. This is the thesis. A clean failure of H3
@@ -39,292 +44,239 @@ layers dest→source; the dot count is the unrolled time axis.
   the prior full-adapter experiment showed the wire can carry serial
   thought; the question is whether it does so *natively*.
 
-## Decisions
+## Architecture: the wire
 
-**D1 — Wire = two-pass, paper-faithful.** (2026-08-20) Each column
-computed twice; readout (and loss) on first-pass logits; second pass
-of column j runs alongside first pass of column j+1 and refreshes
-column j's KV cache from the destination layer up; destination input
-mixed per Eq. 1 with norm-matched source. Rationale: inherits the
-paper's validated out-of-box behavior and layer-pair priors.
+**The recurrence (D1, D7).** Gemma3-1B PT, source/dest {11,4}
+(0-indexed, empirically resolved). Each column is computed twice:
+readout (and loss) come from first-pass logits; the second pass of
+column t−1 runs alongside the first pass of column t and refreshes
+t−1's KV for layers dest+1..top, with the destination input mixed per
+the paper's Eq. 1 — `β·h_d + α·(‖h_d‖/‖h_s‖)·h_s`, norm-matched,
+α ramped over the first 10 positions untrained (α=0.15 convex) and
+produced by the gate MLP when trained. Snapshot rule: both passes of a
+step read the *same* visible past; the refresh joins it only after
+both have run, and the first pass sees column t−1 only at first-pass
+fidelity.
 
-**D2 — Trainable surface = rung (a) only.** (2026-08-20) Learned
-`<t>` embedding row + the paper's α,β-MLP (2 hidden GELU layers,
-hidden = d_model, LN at input, input = concat(source, dest), sigmoid
-output, vector-valued, init α=0.1/β=0.9). Base frozen. Full-adapter
-rung documented as fallback only — tried in the prior experiment:
-worked, but destroyed the naturalness the project exists to test.
+**Canonical execution (D10, D13).** One path: CUDA, bf16, one
+attention library end to end — models load with
+`attn_implementation="wire_attention"`, whose fallback tier defers to
+HF's flash_attention_2 with a registered mask-interface pair, so
+baselines run the engine's kernels. There is no fp32 or CPU path.
+Structure of the inference engine (`wire.RecirculationEngine`):
 
-**D3 — Task suite = discriminating 2×2.** (2026-08-20)
-{dots, none} × {wire, none}, CoT topline. Theory-clean serial rows:
-S5 word problems (NC1-complete, outside Pfau et al.'s filler bound)
-and graph reachability (NL-complete, likewise, modulo standard
-separations). Parity is in TC0 — the bound is formally silent on it —
-so it rides as the empirical learnability probe, not an expressivity
-claim. Parallelizable control: 3SUM (fillers-sufficient per Pfau et
-al.). Money plot: accuracy vs k at eval (inference-time scaling with
-zero legible tokens). Generators are shared with the sibling in the
-root package, `transformer_experiments/dot_tasks.py` — import, don't
-re-implement; `min_path` on reachability scales serial depth and
-suppresses shortcut heuristics; `render_cot` is the topline/curriculum
-trace.
+- **Pass A**: layers 0..dest never see refreshed state, so the bottom
+  slab prefills the whole sequence in parallel (fixed B=64 compiled
+  chunks, final chunk row-index padded).
+- **Serial slab**: layers dest+1..top, the dual pass batched as one
+  [2B] call through the custom op `wire::fa2_kvcache`
+  (per-row `cache_seqlens` express the per-lane prefix lengths).
+- **Branch-decomposed cache**: both branches read one physical
+  refreshed prefix 0..t−2 plus a one-slot side buffer via duplicate
+  `cache_batch_idx`; a compiled two-key softmax with fp32 LSE merge
+  adds each branch's distinct keys. Halves slab KV storage; its bf16
+  association shift is ratified and inside the identity gate.
+- **Steady step**: one position-independent manual CUDA graph with
+  device-resident counters; an adaptive `alpha_fn` falls back to the
+  compiled eager controller.
+- **Packed projections** (`wire.pack_model_projections`): Q/K/V and
+  gate/up packed once per layer, the original Parameters kept as
+  disjoint views (a state-dict hook clones only for serialization).
+  Shared with the training path.
+- Regional `torch.compile(fullgraph)` on the tensor-heavy regions with
+  measured wins (prefill, slab steps, two-key merge, fused NLL); the
+  position loop stays a small eager state machine, and the
+  logits-only head stays eager (compilation never amortizes).
 
-**D4 — Halting is sampling.** (2026-08-20) `<t>` is a real vocab
-token; the LM head chooses dot-vs-answer natively. v0 trains
-teacher-forced fixed k and evals a k-sweep; adaptive dotting later,
-length penalty only if needed.
+**Compilation is setup, not experiment runtime.** Per-shape
+specialization is canon (dynamic shapes were rejected after they
+changed forced-choice cells). Every distinct execution shape warms
+before any clock starts, largest shape first, so cache growth cannot
+recompile cache-dependent graphs; timed or trained loops audit
+Dynamo's unique-graph counter and fail on any escape. Final partial
+batches are duplicate-row padded to the established shape and the
+padding discarded before scoring. Defaults: B=512 (32.7k tok/s at
+10.15 GiB on the 4090 at T=512).
 
-**D5 — Wire scope is a config flag.** (2026-08-20) `full` (all
-positions, paper-style; serial prefill) vs `think` (dot span + answer
-only; parallel prefill, dots become the sole serial channel — forces
-utilization and gives a clean test-time-compute knob). Note: in
-`full` scope the token-conditional gate can *learn* to concentrate α
-on dots; where α mass migrates is an interp readout in its own right.
+**Version pin.** transformers `~=5.15.1` — the wire drives private
+layer/cache contracts; the identity gate is the contract test for any
+bump. torch 2.8 + flash-attn 2.8.3 per the machine constraints.
 
-**D6 — Training mechanics.** (2026-08-20) BPTT serial over positions,
-parallel over batch — fat batches on short formal sequences (the
-prior run's ~20% GPU utilization was serial-loop-with-small-batch).
-Truncated BPTT (detach every m dots) as escape hatch, noting it caps
-the credit-assignment horizon. Curriculum fallback kept ready.
-Hard-won lesson (a9, prior experiment): **the LR schedule must reset
-at every curriculum stage** — each transition is a distribution
-shift, and a single global decay leaves the model unable to adapt
-(one such run fell apart 8 hours in). Per-stage warmup/decay is fine;
-checkpoint at stage boundaries.
+## Tasks and evaluation
 
-**D7 — Model = Gemma3 1B PT.** (2026-08-20) The paper's
-best-characterized receptive model: source/dest {11,4}, convex
-norm-ratio mix (β=1−α), α ramped over the first 10 positions.
-Configurable; 270M as a possible fast-iteration mode would need its
-own sweep gate (uncharacterized in the paper).
+**Suite (D3).** The discriminating 2×2 {dots, none} × {wire, none}
+plus a CoT topline. Serial rows: S5 word problems (NC1-complete,
+outside the filler bound) and graph reachability (NL-complete,
+likewise, modulo standard separations); parity rides as the empirical
+learnability probe (TC0 — the bound is formally silent). Parallel
+control: 3SUM (fillers-sufficient per Pfau et al.). Generators are
+shared with the sibling experiment in
+`transformer_experiments.dot_tasks` — import, don't re-implement.
+Money plot: accuracy vs k at eval — inference-time scaling with zero
+legible tokens, against the untrained zero line in findings.
 
-**D8 — `<t>` token and serialization pins.** (2026-08-20) `<t>` :=
-Gemma3's reserved `<unused0>` slot — already a single token with an
-existing untrained embedding row, tied with the LM head; no vocab
-resize, and training the one row shapes both how the dot is read and
-when it is emitted. Tokenizer facts that pin the format: Gemma3
-splits `" 1"` into two tokens (standalone space + digit) but `"1"`,
-`"yes"`, `"no"` are single tokens — so sequences are composed with
-**no space before the answer** (prompt ends `:`/`?`, then dots, then
-the bare answer token). `render` answers are already space-free;
-composition is consumer-side.
-
-**Gate G0 — implementation correctness.** Before any training:
-(i) α=0 two-pass run reproduces plain-forward logits exactly (cache
-surgery no-op check); (ii) reproduce the paper's untrained perplexity
-reduction on Gemma3 1B, {11,4}, α=0.15, convex norm-ratio + ramp —
-clearly positive, order 10% on PG19/arXiv slices, ~4% on C4;
-(iii) a bad layer pair shows ~no gain (we see their landscape, not an
-artifact). 512-token windows so every sliding-window layer (window
-512) is effectively global and the KV cache stays a plain
-index-assignable tensor — a deliberate deviation from the paper's
-1024 (this is a validation gate, not a replication). No repro, no
-trust. PG19 comes from the emozilla/pg19 parquet mirror (datasets>=5
-refuses the script-based deepmind/pg19).
-
-**D9 — training-path design.** (2026-08-20, incorporating the Codex
-perf consult) The BPTT path gets a *functional token-chunked cache*
-(the wire's in-place lanes are inference-only): per layer, an
-immutable detached prompt prefix + a tuple of refreshed one-token
-tensors + the newest first-pass tensor; dual views built by cat, no
-tensor participating in the graph ever overwritten. Persistent KV at
-B=64, span 40 is ~52 MiB — the real memory is saved attention
-operands (GQA repeat under masks → up to ~8 GiB), so checkpoint each
-decoder-layer call (`use_reentrant=False`). lm_head runs ONLY on
-supervised answer positions — never on dots. Before any training
-run: a gradient gate (B=1, span 3–4) comparing the functional dual
-cache against an out-of-place sequential reference for loss and
-grads of the embedding row + gate MLP. Curriculum LR rule per D6.
-torch.compile belongs to THIS path, not the inference wire: the
-functional cache is mutation-free, so the graph is pure and inductor
-has nothing to functionalize — the measured compile losses on the
-inference wire (broadcast materialization, non-re-inplaced mutations;
-findings 2026-08-20 round 2) do not apply. Keep the `_wire_sdpa`
-stride-0 GQA expansion in the training attention path too.
-
-**D10 — canonical wire: one path.** (2026-08-20, a9 ratified) The
-compiled-FA2 configuration is not the default but the *only* path:
-CUDA, half precision, FlashAttention kvcache for the dual pass,
-torch.compile(fullgraph) over the serial slab. The sdpa dual-pass
-implementation, mask machinery, and backend/compile flags are
-stripped (git history keeps them; findings keeps the measurements).
-Rationale: training and eval share one set of numerics — no mid-run
-surprises from a path switch — and the Mac is not a target. Cost
-knowingly accepted: the fp32 identity gate retired with the sdpa
-path; G0's identity now runs bf16 with thresholds calibrated against
-the measured null (plain HF forward vs itself under a kernel-tiling
-change) — the engine at α=0 sits *inside* that null (mean |Δlogit|
-5.3e-2 vs 5.5e-2; top-1 0.982 vs 0.965; ppl rel 7e-4). The last fp32
-proof of the same algorithm: max |Δlogit| 1.2e-4 (2026-08-20).
-
-*Addendum (same day, a9 ratified): stock sdpa fully retired.* The
-fallback tier (pass A's causal prefill, plain `model(...)` forwards)
-now defers to HF's flash_attention_2 interface, with the paired
-AttentionMaskInterface registration so `create_causal_mask` builds
-FA2-format inputs (None / 2D padding) for our impl name — replacing
-the implicit unknown-name-defaults-to-4D contract with an explicit
-registered pair. Models load with
-`attn_implementation="wire_attention"` so baselines run identical
-kernels before and after engine construction. Consequence, recorded:
-the whole flipped model object is half-precision-only, not just the
-wire — no fp32 baseline will ever run through it. FA2 null re-measured
-(mean 5.5e-2, top-1 0.9785 — unchanged in kind); thresholds stand;
-gates green (identity inside the null; PG19 −8.93%, C4 −5.03%,
-5 s/3 s).
-
-*CUDA compilation addendum (same day, a9 ratified).* Compile every
-tensor-heavy region that has a stable semantic boundary and a measured
-win: packed-QKV / packed-gate-up pass A, the first slab step, recurrent
-mix+slab, and fused chunked NLL. The logits-only BF16 head remains eager;
-its library GEMM does not amortize a separate graph. The outer position
-loop remains the authoritative Python state machine because it advances
-and commits the mutable dual cache; it performs no model math. Pass A always uses one compiled B=64
-signature, padding only its final chunk and writing each result directly
-into pooled destination-state storage. The original Q/K/V and gate/up
-Parameters are disjoint views of their packed tensors; state-dict export
-clones those views only for serialization. Cache/RoPE/scratch state is
-pooled by shape. Default evaluation batch is 512; callers with fewer rows
-still use the available batch rather than manufacturing scored examples.
-Rationale: one graph around an unrolled 512-step mutable loop is brittle
-and enormous; regional fullgraph compilation gets the fusion without
-obscuring the wire's snapshot/commit boundary.
-
-*Higher-effort CUDA addendum (same day, a9 ratified).* The preceding
-controller/cache boundary is superseded after direct 4090 measurement.
-The steady step is now one position-independent manual CUDA graph with
-device-resident counters: selection, recurrent-state threading, cache
-writes, and top-state storage are captured without unrolling 512 copies.
-After the unique first step, the first call warms the fixed-buffer
-signature, captures it, restores the first-step side state, and replays;
-later calls reuse the capture directly. A user-supplied adaptive
-`alpha_fn` retains the compiled eager controller until that gate itself
-has a static capture contract.
-
-Compilation is setup, not experiment runtime. G0 warms each distinct
-`(B,T)` execution shape before starting its evaluation clock, reports
-compile+capture separately, and audits Dynamo's unique-graph counter so
-a timed run fails on any recompile. Final partial batches are padded with
-duplicate rows to the established execution shape and those rows are
-discarded before scoring. Readout scratch similarly pads its final chunk,
-so the default NLL path has five compiled graphs total rather than a
-sixth tail-shape variant. Persistent Inductor caching is used normally;
-no run clears it except an explicit cold-start benchmark.
-
-Task evaluation prepares its longest configured full-wire input before
-scoring. This establishes the largest cache backing and steady CUDA graph
-once, preventing later prompt growth from recompiling cache-dependent slab
-signatures. The current max-k sweep visits at most eight prefill lengths, so
-Dynamo's normal per-frame recompile guard remains intact; no package import
-globally weakens it.
-
-Store the two attention branches by their mathematical decomposition,
-not as duplicated histories. Both queries read one physical refreshed
-prefix `0..t-2`; a one-slot side buffer holds the prior first-pass KV.
-Adjacent `cache_batch_idx` rows let FA2 reuse that prefix, and a compiled
-two-key tail plus fp32 log-sum-exp merge adds each branch's distinct
-keys. Only after the two queries complete does the refresh enter the
-shared prefix. This is the same snapshot boundary, removes the explicit
-commit, and halves slab KV storage. Recurrent RoPE keeps only the compact
-position tables: the compiled step gathers `[t,t-1]` and broadcasts the
-pair over the interleaved branch batch. FA2-integrated RoPE,
-norm-linear algebra, concurrent readout, quantization, and device
-parallelism are not part of the canonical path: the first three failed
-the end-to-end speed gate; the latter two were explicitly out of scope.
-
-**D11 — task serialization and forced-choice eval.** (2026-08-20)
+**Serialization (D8, D11).** `<t>` := Gemma3's reserved `<unused0>` —
+a single token with a tied, untrained embedding row; no vocab resize.
 Sequences are composed in id space and never re-tokenized:
-`[BOS] prompt-ids | think-span → answer`, think span = k×`<unused0>`
-(D8), a tokenizer-native prefix of the `render_cot` trace, or empty;
-the answer token is never part of the eval input — the final
-think/prompt position predicts it.
-Task knobs are pinned so every rendered surface form is a single
-Gemma3 token (reachability runs `nodes=10`; `"10"`/`"11"` split into
-digit pairs). Every wire-facing condition therefore has exactly one
-token length per (task, k) (measured prompt lengths: s5 105, parity 68,
-reachability 82, threesum 53, then +k). CoT is one natural
-space-bearing string, not separately tokenized states: its actual
-Gemma token prefix is capped at k and reported, so a budget means
-tokens rather than an incorrectly assumed state count. Eval is
-forced-choice over label tokens (chance = 1/|labels|); soft-everywhere,
-full-vocab legality and gold logprob ride along. Instance sets are
-paired across conditions. Current scope labels are explicit:
-`none`, `full-wire`, `dots`, `dots+full-wire`, `dots+think-wire`, and
-`cot`; D12's untrained null is `dots+think-wire`, while the historical
-D11 result remains identifiable as `dots+full-wire`.
+`[BOS] prompt-ids | think-span → answer`, the answer token never part
+of the eval input. Gemma3 splits `" 1"` but not `"1"`/`"yes"`/`"no"`,
+so composition is space-free (the prompt ends with its own cue
+token). Task knobs are pinned so every rendered surface form is one
+token (reachability at nodes=10 — "10"/"11" split), giving exactly one
+token length per (task, k): s5 105, parity 68, reachability 82,
+threesum 53, plus k. CoT is one natural space-bearing string,
+truncated by actual token count when budgeted.
 
-**D12 — training path v0.** (2026-08-21, forks a9-ratified)
-**Think-first** (F1): the think scope trains first — cheapest serial
-span (k+1, not prompt+k+1), shortest credit-assignment chain, forced
-wire utilization; full scope follows. Structural note: the wire-alone
-cell of the 2×2 is inherently full-scope (without dots its think span
-is one position), so it joins at the full-scope run. **k sampled per
-batch** from the eval sweep set (F2), homogeneous within a batch.
-**lm_head over the whole emission span** (F3, a9's call — supersedes
-D9's answer-only line): the last prompt position and every dot target
-`<t>`, the last dot targets the answer. With sampled k this teaches a
-stopping *hazard* — D4's halting-by-sampling activates in v0. Loss is
-`CE(answer) + λ·mean(CE(emission))` so the task gradient is
-k-independent; dot targets carry no task content, so credit for the
-computation flows only through the answer term (H2 stays clean).
-Interior prompt positions stay unsupervised (detached hiddens, no
-surface signal). **Mixture is the goal, per-task the benchmark** (F4).
-Defaults: online fresh sampling (train seeds disjoint from the eval
-seed), full-vocab CE. Surface: BF16 throughout — the `<t>` row (tied:
-synced into the model embedding for plain-forward arms) + the D2 gate
-MLP, zero-init output layer with logit biases so training starts near
-α=0.1, β=0.9 at BF16 precision. Gemma RMSNorm retains its model-defined
-FP32 reduction accumulator before returning BF16; there are no FP32
-surface masters or FP32-only readout branches. The gradient gate is
-null-calibrated (flash-attn's backward uses atomics; even the same
-path twice is not bitwise), activates the whole gate with a second
-deterministic nonzero output-weight state, and is paired with an HF
-cross-check. Recorded limitation: the CoT
-topline stays frozen — nothing is trainable under a frozen base, so
-it is the *in-context* legible reference, not a trace-supervised
-ceiling (that would need unfreezing; out of scope).
+**Evaluation (D4, D11).** Forced-choice at the final position: argmax
+over the task's label tokens (chance = 1/|labels|); soft-everywhere,
+full-vocab legality (does the unrestricted argmax land in the label
+set) and the gold answer's full-vocab logprob ride along. Instance
+sets are paired across conditions. Scope labels are explicit: `none`,
+`full-wire`, `dots`, `dots+full-wire`, `dots+think-wire`, `cot`; the
+training condition `dots+wire` denotes think scope, and its untrained
+null is `dots+think-wire`. Dot sweeps run max-k once and read every
+smaller k as a causal prefix — mathematically the same prefix, so the
+max-k shape is the canonical sweep definition; both trained arms use
+the identical live-row bf16 readout.
 
-**D13 — audited CUDA training path.** (2026-08-21) The loader freezes
-the base before any graph exists. Q/K/V and gate/up projections are
-packed once and the original Parameters become disjoint views of that
-storage; prompt prefill, parallel span, and serial layer math share
-regional `torch.compile(fullgraph)` functions. Adaptive gate/mix and the
-standalone final norm/concatenation stay eager: isolated compilation was
-whole-step neutral and added several seconds of cold setup. At a recurrent
-step, refresh and first-pass tokens are projected together and attend through
-one differentiable `flash_attn_varlen_func` call with per-branch lengths.
-The persistent functional cache stays piecewise; prefix concatenation
-lives inside non-reentrant checkpoint recomputation with RNG preservation
-disabled (the path is deterministic), avoiding the
-rejected O(k²) materialized-prefix peak. Checkpoint policy is `auto`:
-`--batch` is the effective optimizer batch; retain activations in equal-shape
-microbatches while `B*k <= 2048`, then prefer the full effective batch with
-recomputation at long k. At the canonical B=512, k=16 plan, four evenly
-spaced recurrent layers retain activations and the other 22 recompute; k=32
-recomputes every layer. The BF16 LM head flattens to a 2-D GEMM, compiles
-fused CE, uses a 512-row slab, and scratch-pads the final slab to one shape.
+## Training recipe
 
-Evaluation runs max-k once and reads the selected causal positions for
-every smaller k. This is mathematically the same prefix; FA2 tiling at
-different standalone lengths has the usual BF16 null, so the max-k
-shape is the canonical sweep definition. Trained dots and think-wire
-arms use the identical live-row BF16 readout. Training batches are
-generated deterministically by `(seed, step)` in one bounded worker,
-pinned, and copied nonblocking. Every structural graph, task prompt
-family, and configured eval shape warms before timing; a unique-graph
-audit rejects compilation in a train step. Repeated evaluation stores the
-frozen prompt hidden/KV state in a bounded, packed, pinned-host LRU. Its
-one-time D2H fill overlaps the serial dot steps, and both the miss and restored
-view layouts warm before the experiment clock. Checkpoints are atomically
-replaced and contain surface, optimizer, completed step, CLI config,
-and Python/Torch/CUDA RNG states. Default checkpoint path is the ignored
-`data/train/surface.pt`; `--resume` continues the addressable schedule.
-Training and inference/task evaluation both default to B=512. The former is
-an effective batch: k=8 executes as B=256×2, while k=16/32 executes directly
-at B=512. Manual whole-step CUDA graphs are not part of the contract: at
-these throughput shapes they save at most about 1% while pinning 15–20 GiB
-of private graph-pool memory.
+**Surface (D2).** The entire trainable state: the `<t>` embedding row
+(tied — it shapes both how a dot is read and when it is emitted;
+synced into the model embedding for plain-forward arms) plus the
+paper's gate MLP (LN on concat(source, dest), two hidden GELU layers
+at d_model, sigmoid vector output; zero-init output layer with logit
+biases so training starts exactly at α=0.1, β=0.9). BF16 throughout;
+only Gemma's own RMSNorm fp32 reduction accumulator is wider. Base
+frozen — enforced: the loader freezes before any graph exists, and
+the first step raises if any base Parameter accumulates a gradient.
+The full-adapter rung is documented fallback only.
+
+**Scope and schedule (D5, D12).** Think-first: the prompt is
+prefilled once, frozen and detached; the dot span is the only serial
+region, forcing wire utilization and keeping the credit chain short.
+Full scope follows in a later phase (the wire-alone 2×2 cell is
+inherently full-scope and joins then; in full scope, where the gate
+concentrates α is an interp readout in its own right). k is sampled
+per step from the eval sweep set, homogeneous within a batch; task
+sampled per step likewise (mixture is the goal, per-task the
+benchmark). Sampling is online and fresh, train seeds disjoint from
+the eval seed, addressable by `(seed, step)` for exact resume.
+
+**Forward (D9).** The functional think-scope wire: one parallel
+bottom-slab call over the whole dot span (exact — dots' layers
+0..dest never see refreshed state and the dot embedding is
+input-known), then the serial two-pass slab with the gate MLP at each
+mix, under the same snapshot rule as the inference wire. Per slab
+layer the cache is piecewise — detached prompt KV, settled one-token
+refreshed KVs, the previous column's first-pass frontier — and
+nothing in the graph is ever overwritten; the refresh and first-pass
+branches share one packed projection and one differentiable
+FA2-varlen call (the inference kvcache op has no backward). KV views
+are assembled inside non-reentrant checkpointed layer calls with RNG
+preservation off, so no prefix copy survives the forward.
+
+**Supervision (D12).** lm_head over the whole emission span: the last
+prompt position and every dot target `<t>`; the last dot targets the
+answer. Loss `CE(answer) + λ·mean(CE(emission))` (default λ=1) — the
+task gradient is k-independent, the dot targets carry no task
+content (H2 stays clean), and with sampled k the emission term
+teaches a stopping *hazard*, activating D4's halting-by-sampling in
+v0. Interior prompt positions stay unsupervised. Full-vocab CE via
+one-shape compiled 512-row slabs with a live tied `<t>` column.
+
+**Optimization (D6).** AdamW, weight decay 0, lr 1e-3, linear warmup
+(default 100 steps) then flat — no global decay, so later curriculum
+stages (if H2 needs them) each reset their own schedule; the prior
+experiment's hard-won lesson is that a single decaying schedule
+across stage transitions falls apart. Checkpoints are atomic and
+RNG/optimizer-complete, resumable by step (`--resume`), default
+`data/train/surface.pt`.
+
+**Execution policy (D13).** `--batch` is the effective optimizer
+batch (default 512). `checkpoint=auto` from measured 4090 knees:
+retain activations while B·k ≤ 2048 (splitting into equal-shape
+microbatches up to k=8), at B=512/k=16 retain four evenly spaced
+recurrent layers, at k=32 recompute everything. Batch production is a
+bounded one-worker deterministic pipeline with pinned nonblocking
+transfer. Every structural graph, prompt family, and eval shape warms
+before the clock; a step that compiles anything raises. Periodic eval
+during training reuses the max-k sweep with a bounded pinned-host LRU
+of frozen prompt state.
+
+**Recorded limitation.** The CoT topline stays frozen — nothing is
+trainable under a frozen base, so it is the *in-context* legible
+reference, not a trace-supervised ceiling (that would need
+unfreezing; out of scope).
+
+## Gates
+
+No green gates, no trust. Re-run after touching anything model-facing.
+
+- **G0 identity** (`g0 identity`): the α=0 two-pass engine must match
+  the plain HF forward inside the measured bf16 null — thresholds
+  mean |Δlogit| < 0.15, top-1 > 0.95, ppl rel < 3e-3, calibrated
+  against kernel-tiling self-noise (~5.5e-2 / 0.965) with
+  machinery-bug scale ~20× higher; the ppl bound is deliberately
+  narrow around the ratified two-key kernel's drift. The retired fp32
+  reference proved the algorithm exact (max |Δlogit| 1.2e-4).
+- **G0 repro** (`g0 repro`): the paper's untrained perplexity
+  reduction at {11,4}, α=0.15 — order −9% PG19, −5% C4, with
+  `--pairs` controls ~null. 512-token windows keep every
+  sliding-window layer effectively global (deliberate deviation from
+  the paper's 1024; validation, not replication).
+- **Gradient gate** (`train gate`): the functional BPTT path vs a
+  naive reference (per-column sequential bottom, unbatched dual
+  passes, visibility re-derived by column index, no checkpointing —
+  deliberately independent, after shared bookkeeping once hid a real
+  bug) on loss and every surface gradient, in both the zero-init and
+  a deterministic perturbed-gate state (zero-init blocks the hidden
+  MLP layers); plus an HF cross-check of the span drive with the row
+  synced in. Thresholds: loss rel < 5e-3, grad max-rel < 0.1,
+  HF mean |Δlogit| < 0.15, top-1 > 0.95 — pinned in the gap between
+  measured kernel noise (~2e-2) and semantic-bug scale (O(0.5+)).
+- **Runtime audits**: unique-graph counters in timed/trained loops;
+  the frozen-base gradient check at the first step; `pytest tests`
+  (shape/policy/serialization contracts, Mac-runnable) and Ruff.
+
+## Decision register
+
+Stable anchors; one line each, current resolution only. Dates,
+alternatives, and the paths not taken are in the journal.
+
+- **D1** Wire = two-pass, paper-faithful; readout on first-pass
+  logits; refresh from dest up; Eq. 1 norm-matched mix.
+- **D2** Trainable surface = `<t>` row + α,β gate MLP only; base
+  frozen; full adapter is fallback, not the experiment.
+- **D3** Task suite = discriminating 2×2 (S5, parity, reachability;
+  3SUM control) + CoT topline; money plot accuracy vs k.
+- **D4** Halting is sampling: `<t>` is a real vocab token; the head
+  chooses dot-vs-answer natively; v0 trains fixed sampled k.
+- **D5** Wire scope is a config axis: think (v0) vs full (later);
+  full-scope α migration is an interp readout.
+- **D6** Fat batches, BPTT serial over positions; flat LR after
+  warmup; any curriculum stage resets its schedule.
+- **D7** Model = Gemma3-1B PT, pair {11,4} 0-indexed, α=0.15 ramped
+  over 10 positions untrained.
+- **D8** `<t>` := `<unused0>` (single token, tied row, no resize);
+  space-free id-space composition.
+- **D9** Training path = functional piecewise cache, differentiable
+  FA2, checkpointed layer calls; gradient gate mandatory.
+- **D10** One canonical wire path: CUDA + bf16 + FA2 + regional
+  compile; no fp32/CPU/sdpa tier; bf16 gates are null-calibrated.
+- **D11** Id-space serialization, single-token pins, forced-choice
+  eval with legality and gold_lp; explicit scope labels.
+- **D12** Training v0: think-first, k sampled per batch,
+  emission-span supervision `CE(ans) + λ·mean(CE(emit))`, per-task
+  benchmark then mixture; online sampling; bf16 surface.
+- **D13** Audited CUDA training: packed shared projections, regional
+  compile, FA2-varlen dual branch, `checkpoint=auto` knees, max-k
+  sweep eval, warm-everything + zero-compile-in-step, atomic
+  RNG-complete resume; whole-step CUDA graphs rejected.
 
 ## Open
 
 - Reachability negatives are unconstrained; if shortcut heuristics
   show up in the 2×2, add near-miss negatives to the shared module.
+- Adaptive-k evaluation (sampled halting at inference) once a trained
+  surface exists — the stopping hazard is already trained in v0.
