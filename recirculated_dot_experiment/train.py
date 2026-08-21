@@ -373,16 +373,34 @@ def _layer_call(layer, causal: bool, x: Tensor, cos: Tensor, sin: Tensor, *kv):
 
 
 @torch.no_grad()
-def _prompt_prefill(model, prompt_ids: Tensor):
-    """Frozen parallel prompt pass: last top hidden + per-layer KV
-    (flash layout, detached). no_grad, not inference_mode — the outputs
-    become constants inside a later autograd graph."""
-    out = model.model(input_ids=prompt_ids, use_cache=True)
-    kv = [
-        (k.transpose(1, 2).contiguous(), v.transpose(1, 2).contiguous())
-        for k, v, _ in out.past_key_values  # (keys, values, sliding-window)
-    ]
-    return out.last_hidden_state[:, -1:], kv
+def _prompt_prefill(model, packed, prompt_ids: Tensor):
+    """Frozen packed/compiled prompt pass: top hidden plus per-layer KV."""
+    batch, length = prompt_ids.shape
+    dtype = model.model.embed_tokens.weight.dtype
+    scale = float(model.config.hidden_size) ** 0.5
+    x = model.model.embed_tokens(prompt_ids) * scale
+    positions = torch.arange(length, device=prompt_ids.device)
+    rope = _rope(model, positions, dtype)
+    empty = torch.empty(
+        batch,
+        0,
+        model.config.num_key_value_heads,
+        model.config.head_dim,
+        device=prompt_ids.device,
+        dtype=dtype,
+    )
+    kv = []
+    for i in range(model.config.num_hidden_layers):
+        x, k, v = _single_layer_c(
+            x,
+            *_pe(rope, model.config.layer_types, i),
+            empty,
+            empty,
+            *_layer_args(model, packed, i),
+            True,
+        )
+        kv.append((k, v))
+    return model.model.norm(x[:, -1:]), kv
 
 
 def _pe(rope, layer_types, i, sl=None):
@@ -493,7 +511,7 @@ def think_outputs(
     dtype = model.model.embed_tokens.weight.dtype
     packed = pack_model_projections(model)
     scale = float(model.config.hidden_size) ** 0.5
-    h_init, prompt_kv = _prompt_prefill(model, ids[:, :P])
+    h_init, prompt_kv = _prompt_prefill(model, packed, ids[:, :P])
 
     positions = torch.arange(P, T, device=ids.device)
     span_rope = _rope(model, positions, dtype)
@@ -571,7 +589,7 @@ def parallel_outputs(
     dtype = model.model.embed_tokens.weight.dtype
     packed = pack_model_projections(model)
     scale = float(model.config.hidden_size) ** 0.5
-    h_init, prompt_kv = _prompt_prefill(model, ids[:, :P])
+    h_init, prompt_kv = _prompt_prefill(model, packed, ids[:, :P])
     positions = torch.arange(P, T, device=ids.device)
     span_rope = _rope(model, positions, dtype)
     x = (surface.row.to(dtype) * scale).expand(B, k, -1)
@@ -713,7 +731,8 @@ def reference_outputs(
     dtype = model.model.embed_tokens.weight.dtype
     scale = float(model.config.hidden_size) ** 0.5
     n_layers = model.config.num_hidden_layers
-    h_init, prompt_kv = _prompt_prefill(model, ids[:, :P])
+    packed = pack_model_projections(model)
+    h_init, prompt_kv = _prompt_prefill(model, packed, ids[:, :P])
     positions = torch.arange(P, T, device=ids.device)
     rope = _rope(model, positions, dtype)
     e = (surface.row.to(dtype) * scale).expand(B, 1, -1)
