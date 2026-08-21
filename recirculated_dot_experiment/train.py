@@ -377,8 +377,7 @@ def _prompt_prefill(model, packed, prompt_ids: Tensor):
     """Frozen packed/compiled prompt pass: top hidden plus per-layer KV."""
     batch, length = prompt_ids.shape
     dtype = model.model.embed_tokens.weight.dtype
-    scale = float(model.config.hidden_size) ** 0.5
-    x = model.model.embed_tokens(prompt_ids) * scale
+    x = model.model.embed_tokens(prompt_ids)
     positions = torch.arange(length, device=prompt_ids.device)
     rope = _rope(model, positions, dtype)
     empty = torch.empty(
