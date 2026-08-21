@@ -1012,28 +1012,52 @@ def run_mode(args) -> None:
     print(f"condition {args.condition}, tasks {task_list}, k {k_set}, B {args.batch}")
 
     producer = _BatchProducer(tok, args, task_list, k_set, start_step)
+    completed_step = start_step - 1
     try:
-        # Compile and allocate at the largest recurrent shape before the
-        # experiment clock. This performs no optimizer update.
-        warm_task, warm_k = task_list[0], max(k_set)
+        # Cover the distinct structural regimes before the experiment clock:
+        # no pair (k=1), first pair (k=2), dynamic steady prefix (k>=4),
+        # largest activation footprint, and every prompt family. No optimizer
+        # update occurs, and the timed loop rejects any escaped compile.
         warm_args = argparse.Namespace(**vars(args))
         warm_args.seed = args.seed + 97_531
         warm_args.batch = args.batch
-        warm_task_list = [warm_task]
-        warm_k_set = [warm_k]
-        _, _, ids_cpu, answers_cpu, span_start = _make_cpu_batch(
-            tok, warm_args, warm_task_list, warm_k_set, 0
-        )
-        ids = ids_cpu.to("cuda", non_blocking=True)
-        answers = answers_cpu.to("cuda", non_blocking=True)
+        structural = [max(k_set), 1, 2, 4]
+        structural = [min(k_set, key=lambda value: abs(value - k)) for k in structural]
+        warm_cases = [(task_list[0], k) for k in structural]
+        warm_cases.extend((task, structural[-1]) for task in task_list)
+        warm_cases = list(dict.fromkeys(warm_cases))
         compile_start = time.perf_counter()
-        warm_ckpt = _checkpoint_for(args.checkpoint, args.batch, warm_k)
-        warm_loss = _forward_loss(
-            model, surface, ids, answers, span_start, args, warm_ckpt
-        )[0]
-        torch.autograd.grad(warm_loss, tuple(surface.parameters()))
+        for warm_index, (warm_task, warm_k) in enumerate(warm_cases):
+            _, _, ids_cpu, answers_cpu, span_start = _make_cpu_batch(
+                tok, warm_args, [warm_task], [warm_k], warm_index
+            )
+            ids = ids_cpu.to("cuda", non_blocking=True)
+            answers = answers_cpu.to("cuda", non_blocking=True)
+            warm_ckpt = _checkpoint_for(args.checkpoint, args.batch, warm_k)
+            warm_loss = _forward_loss(
+                model, surface, ids, answers, span_start, args, warm_ckpt
+            )[0]
+            torch.autograd.grad(warm_loss, tuple(surface.parameters()))
+        if args.eval_every:
+            for task_name in task_list:
+                evaluate_sweep(
+                    model,
+                    surface,
+                    tok,
+                    task_name,
+                    k_set,
+                    args.eval_n,
+                    args.condition,
+                    args.source,
+                    args.dest,
+                    args.batch,
+                )
         torch.cuda.synchronize()
-        print(f"compile/warmup {time.perf_counter() - compile_start:.1f}s (not timed)")
+        compiled_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+        print(
+            f"compile/warmup {time.perf_counter() - compile_start:.1f}s "
+            f"({compiled_graphs} graphs, not timed)"
+        )
         del warm_loss, ids, answers, ids_cpu, answers_cpu
         gc.collect()
         torch.cuda.empty_cache()
@@ -1050,11 +1074,20 @@ def run_mode(args) -> None:
             )
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            if any(parameter.grad is not None for parameter in model.parameters()):
+            current_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+            if current_graphs != compiled_graphs:
+                raise RuntimeError(
+                    "a compile escaped warmup: "
+                    f"{compiled_graphs} -> {current_graphs} unique graphs"
+                )
+            if step == start_step and any(
+                parameter.grad is not None for parameter in model.parameters()
+            ):
                 raise RuntimeError("frozen base model accumulated a gradient")
             for group in opt.param_groups:  # linear warmup, then flat (D6)
                 group["lr"] = args.lr * min(step / max(args.warmup, 1), 1.0)
             opt.step()
+            completed_step = step
             if step % args.log_every == 0:
                 torch.cuda.synchronize()
                 dt = time.perf_counter() - t0
@@ -1087,6 +1120,10 @@ def run_mode(args) -> None:
                     print(f"  eval {task_name:12s} acc/legal  {row}")
             if args.save_every and step % args.save_every == 0:
                 _save_checkpoint(args.out, surface, opt, args, step)
+    except KeyboardInterrupt:
+        _save_checkpoint(args.out, surface, opt, args, completed_step)
+        print(f"interrupted; checkpointed completed step {completed_step}")
+        raise
     finally:
         producer.close()
     _save_checkpoint(args.out, surface, opt, args, args.steps)
