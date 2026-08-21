@@ -812,14 +812,11 @@ def gate_mode(args) -> None:
     # blocks gradients into norm/h1/h2. A second deterministic perturbation
     # activates the complete MLP so the gate checks every trainable tensor.
     with torch.no_grad():
-        values = torch.linspace(
-            -1e-3,
-            1e-3,
-            surface.gate.out.weight.numel(),
-            device=surface.row.device,
-            dtype=surface.row.dtype,
+        generator = torch.Generator(device=surface.row.device).manual_seed(1729)
+        surface.gate.out.weight.normal_(
+            std=1e-3,
+            generator=generator,
         )
-        surface.gate.out.weight.copy_(values.view_as(surface.gate.out.weight))
     lp1, gp1 = _loss_and_grads(functional, surface)
     lp2, gp2 = _loss_and_grads(reference, surface)
     perturbed_diff = _grad_diff(gp1, gp2)
@@ -832,9 +829,9 @@ def gate_mode(args) -> None:
     with torch.no_grad():
         h = parallel_outputs(model, surface, ids, start)
         ours = answer_logits_from(model, surface, h)
-        hf = model(ids, logits_to_keep=1).logits[:, -1].float()
+        hf = model(ids, logits_to_keep=1).logits[:, -1]
     mean = float((ours - hf).abs().mean())
-    top1 = float((ours.argmax(-1) == hf.argmax(-1)).float().mean())
+    top1 = float((ours.argmax(-1) == hf.argmax(-1)).to(torch.bfloat16).mean())
     print(f"span-drive vs HF forward: mean|dlogit| {mean:.3e}, top1 {top1:.4f}")
 
     # Measured 2026-08-21 (B=2, parity len 4, k=3): rerun null 0 (bitwise
