@@ -446,20 +446,23 @@ Five remaining opportunities were timed on the RTX 4090. Four produced a
 useful canonical change; manual whole-step CUDA graphs did not.
 
 1. **K-aware effective batches.** Training now defaults to effective B=512.
-   For k=8, auto mode runs two retained B=256 microbatches: **1.0611 s,
-   482.5 examples/s, 13.09 GiB**. One checkpointed B=512 step was **1.1789 s,
-   434.3 examples/s, 9.07 GiB**, so the equal-shape accumulation is 11.1%
+   For k=8, auto mode runs two retained B=256 microbatches: the final
+   committed candidate measured **1.0604 s / 482.8 examples/s / 13.08 GiB**.
+   One checkpointed B=512 step was **1.1789 s, 434.3 examples/s, 9.07 GiB**,
+   so the equal-shape accumulation is 11.1%
    faster. For k=16 and k=32, the larger checkpointed GEMMs win: B=512
-   measured **2.0674 s / 247.7 examples/s / 11.58 GiB** and **4.0650 s /
-   126.0 examples/s / 17.82 GiB**. B=640,k=32 reached 21.77 GiB with no
-   throughput gain (125.0 examples/s), fixing B=512 as the long-k knee.
+   measured **2.0674 s / 247.7 examples/s / 11.58 GiB** and, on the final
+   candidate, **4.0236 s / 127.2 examples/s / 17.79 GiB**. B=640,k=32
+   reached 21.77 GiB with no throughput gain (125.0 examples/s), fixing
+   B=512 as the long-k knee.
 2. **Selective activation checkpointing.** At B=512,k=16, retaining four
    evenly spaced recurrent layers and checkpointing 22 improved **2.0674 →
-   2.0286 s (1.9%)**, at **18.00 GiB**. Retaining eight layers OOMed. At
-   k=32, retaining even one recurrent layer OOMed once the compiled head was
-   live, so the safe all-layer plan remains authoritative. Checkpoint calls
-   no longer preserve CUDA RNG state because the captured region contains no
-   stochastic operation.
+   2.0286 s (1.9%)**, at **18.00 GiB**; the final committed candidate
+   remeasured **2.0252 s / 252.8 examples/s / 18.01 GiB**. Retaining eight
+   layers OOMed. At k=32, retaining even one recurrent layer OOMed once the
+   compiled head was live, so the safe all-layer plan remains authoritative.
+   Checkpoint calls no longer preserve CUDA RNG state because the captured
+   region contains no stochastic operation.
 3. **Compiled adaptive surface.** Gate MLP, sigmoid alpha/beta, norm-matched
    mixing, final RMSNorm, packed decoder math, and train CE are now regional
    fullgraph compilations. Gate/mix was whole-step neutral at B=256,k=8
