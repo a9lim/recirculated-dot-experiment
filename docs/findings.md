@@ -104,8 +104,10 @@ zero (checked at step 1). Periodic evaluation uses the max-k sweep
 (2.92× over per-k executions) with the pinned-host prompt-state LRU
 (a further 1.48× on repeated sweeps, bitwise-equal hiddens). The
 batch producer never starves the GPU (worst observed wait 18 µs
-behind a 150 ms step). Training warms ~14 graphs before the clock and
-compiles nothing inside steps.
+behind a 150 ms step). Training warms every configured k before the
+clock (38 graphs for dots+wire, 16 for dots, full default k set) and
+compiles nothing inside steps — the audit that enforces this caught
+two real warm-coverage holes at launch (journal 2026-08-21).
 
 ## Training smoke (pre-scale sanity)
 
