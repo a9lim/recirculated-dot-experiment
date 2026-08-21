@@ -414,16 +414,16 @@ median **290.91 → 98.72 ms (2.95×)**, peak **6.38 → 3.54 GiB
 Parameters (**1.862 GiB**); the new path accumulated zero. Isolated
 512-row head forward+backward improved **8.42 → 6.63 ms (1.27×)**.
 
-The adaptive checkpoint tradeoff at B=256,k=8 was **662.8 ms / 12.97
-GiB** without recomputation versus **772.3 ms / 4.44 GiB** with it; auto
-therefore takes the 14.2% faster retained path while leaving more than
+The adaptive checkpoint tradeoff at B=256,k=8 was **531.0 ms / 13.05
+GiB** without recomputation versus **619.5 ms / 5.52 GiB** with it; auto
+therefore takes the 16.7% faster retained path while leaving more than
 10 GiB headroom. At the long default stress point B=256,k=32, the
-piecewise checkpointed path measured **2.47 s / 9.10 GiB**. A rejected
+piecewise checkpointed path measured **2.32 s / 10.17 GiB**. A rejected
 intermediate that persisted assembled prefixes reached 22.76 GiB; no
 such cache remains.
 
-Max-k evaluation over k={1,2,4,8}, B=64 measured **0.110 s versus 0.330
-s (3.00×)** for four standalone executions. Sweep-vs-standalone mean
+Max-k evaluation over k={1,2,4,8}, B=64 measured **0.081 s versus 0.237
+s (2.92×)** for four standalone executions. Sweep-vs-standalone mean
 logit differences were 0.047–0.056 for smaller k, inside the established
 BF16 kernel-tiling null; full-vocab top-1 agreed 100%. Natural S5 CoT now
 decodes as `3 3 2 ...` (15 actual tokens for eight states), not `332...`.
@@ -435,7 +435,7 @@ Final gates: full zero-init and perturbed-gate gradient checks PASS
 (functional/reference losses equal at BF16 resolution; max relative
 gradient differences 2.27e-2 and 5.18e-2), span/HF top-1 1.000 with mean
 |dlogit| 9.42e-2, inference G0 identity PASS at its canonical 5.80e-2 /
-0.9746 / 27.0229→27.0575 measurements, six project tests on Jobe, seven
+0.9746 / 27.0229→27.0575 measurements, seven project tests on Jobe, seven
 shared task tests on both machines, and zero train-step graphs after the
-14-graph structural warmup. Compile/warmup is reported separately and
+15-graph structural warmup. Compile/warmup is reported separately and
 excluded from the experiment clock.
