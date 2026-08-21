@@ -286,6 +286,38 @@ _single_layer_c = torch.compile(_single_layer_math, fullgraph=True, dynamic=True
 _dual_layer_c = torch.compile(_dual_layer_math, fullgraph=True, dynamic=True)
 
 
+def _dual_layer_from_pieces(
+    refresh: Tensor,
+    first: Tensor,
+    cos_refresh: Tensor,
+    sin_refresh: Tensor,
+    cos_first: Tensor,
+    sin_first: Tensor,
+    frontier_k: Tensor,
+    frontier_v: Tensor,
+    *args,
+):
+    """Assemble functional KV inside checkpoint, so no prefix copy survives."""
+    layer_args = args[:17]
+    pieces = args[17:]
+    half = len(pieces) // 2
+    shared_k = torch.cat(pieces[:half], dim=1)
+    shared_v = torch.cat(pieces[half:], dim=1)
+    return _dual_layer_c(
+        refresh,
+        first,
+        cos_refresh,
+        sin_refresh,
+        cos_first,
+        sin_first,
+        shared_k,
+        shared_v,
+        frontier_k,
+        frontier_v,
+        *layer_args,
+    )
+
+
 def _layer_args(model, packed, i: int) -> tuple:
     layer = model.model.layers[i]
     attn = layer.self_attn
@@ -428,14 +460,15 @@ def _slab_pair(
             sin_refresh,
             cos_first,
             sin_first,
-            *shared[i],
             *frontier[i],
             *_layer_args(model, packed, i),
+            *shared[i][0],
+            *shared[i][1],
         )
         if ckpt:
-            out = checkpoint(_dual_layer_c, *args, use_reentrant=False)
+            out = checkpoint(_dual_layer_from_pieces, *args, use_reentrant=False)
         else:
-            out = _dual_layer_c(*args)
+            out = _dual_layer_from_pieces(*args)
         refresh, first, kr, vr, kf, vf = out
         refresh_kv.append((kr, vr))
         first_kv.append((kf, vf))
@@ -476,7 +509,7 @@ def think_outputs(
     # refresh joins it only after both have run (the wire's snapshot
     # boundary), and the first pass sees column t-1 only through the
     # frontier, at first-pass fidelity.
-    shared = {i: prompt_kv[i] for i in slab}
+    shared = {i: ((prompt_kv[i][0],), (prompt_kv[i][1],)) for i in slab}
     frontier: dict[int, tuple[Tensor, Tensor]] = {}
     tops, h_s_prev = [], None
     x1, h_s_prev, new_kv = _slab_first(
@@ -485,7 +518,7 @@ def think_outputs(
         h_dest[:, :1],
         slice(0, 1),
         span_rope,
-        shared,
+        {i: (shared[i][0][0], shared[i][1][0]) for i in slab},
         dest + 1,
         n_layers,
         source,
@@ -513,8 +546,8 @@ def think_outputs(
         )
         shared = {
             i: (
-                torch.cat((shared[i][0], refresh_kv[j][0]), dim=1),
-                torch.cat((shared[i][1], refresh_kv[j][1]), dim=1),
+                (*shared[i][0], refresh_kv[j][0]),
+                (*shared[i][1], refresh_kv[j][1]),
             )
             for j, i in enumerate(slab)
         }
@@ -577,7 +610,9 @@ def head_ce(model, surface: Surface, hiddens: Tensor, targets: Tensor) -> Tensor
     W = model.lm_head.weight
     softcap = getattr(model.config, "final_logit_softcapping", None)
     B, S, _ = hiddens.shape
-    chunk = max(1, 1024 // B)
+    # A 512-row full-vocab slab leaves headroom at the B=256,k=32 gate;
+    # one compiled shape is reused and the final slab is scratch-padded.
+    chunk = max(1, 512 // B)
     padded = ((S + chunk - 1) // chunk) * chunk
     if padded != S:
         hiddens = torch.cat(
