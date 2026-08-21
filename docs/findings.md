@@ -269,6 +269,45 @@ alpha fallback all finite. The 100x512 reproduction remains PG19
 recalibrated G0 boundary and remains jointly constrained by all three
 metrics.
 
+## Tasks: serialization + untrained baseline 2×2 (2026-08-20)
+
+D11 landed: id-space composition over the shared generators, pinned
+single-token surfaces (reachability at nodes=10 — "10"/"11" split into
+digit pairs), forced-choice readout via the engine's new
+`answer_logits` (identity gate re-passed at the recorded numbers after
+the `_run` extraction — pure code motion). One Dynamo guardrail
+raised: `recompile_limit` 8 → 256. A task grid's ~30 distinct lengths
+are deliberate per-shape compiles, and the default limit hard-aborts
+under fullgraph at the 9th shape (hit mid-grid at parity T=69);
+accidental-recompile protection remains G0's unique-graph audit.
+
+Full untrained grid (4 tasks × {none, wire, dots, dots+wire} + cot,
+k ∈ {1,2,4,8,16,32}, n=512, B=512, ~8 min wall including compiles):
+
+- **Accuracy at chance everywhere** — no untrained condition computes
+  anything. Constant-in-k cells (threesum 0.518, reachability ~0.525)
+  are the degenerate majority pick: the forced choice lands on one
+  fixed label, so acc = that label's empirical split.
+- **Legality 0.000 in every non-CoT cell**: the pretrained model never
+  spontaneously emits a bare space-free answer token. Putting mass on
+  the answer surface is precisely the trained embedding row's job
+  (D2/D8); this is the null it is measured against.
+- **CoT toplines split by content**: parity legal 1.000 / gold_lp
+  −0.78 (≈ln ½ — fully in answer space, knows it's a bit, not which);
+  s5 legal 0.990 / gold_lp −2.42 but acc 0.148 *below* chance 0.20 —
+  it continues the digit pattern rather than reading off the final
+  state; reachability 0.568 / legal 0 — the BFS trace leaks the answer
+  (last node = target iff reachable) but untrained it barely helps.
+- **The wire's ppl gain shows through the task lens**: gold_lp
+  improves under wire in nearly every matched pair (s5 none −8.54 →
+  wire −7.18; reachability −8.52 → −7.92; dots vs dots+wire likewise
+  at small k), while untrained dots cost gold_lp (k=1 mild, k≥2
+  settling near −18: untrained `<unused0>` rows push the readout
+  off-distribution).
+
+This is the pre-training reference row for the money plot (accuracy
+vs k): every trained gain has its null here.
+
 ## Memory and throughput scaling pass (2026-08-20)
 
 Four compatible changes now define the canonical memory layout and batch
