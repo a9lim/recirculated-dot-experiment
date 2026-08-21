@@ -1,5 +1,38 @@
 # Findings
 
+## Train: gradient gate + smoke (2026-08-21)
+
+D12 landed (think-first, sampled k, emission-span supervision,
+per-task-then-mixture; forks a9-ratified). The training path is the
+functional think-scope wire: frozen parallel prompt prefill (detached
+per-layer KV), one parallel bottom-slab call over the whole dot span
+(exact — dots' layers 0..dest never see refreshed state and the dot
+embedding is input-known), then the serial two-pass slab with the
+gate MLP at each mix, K/V cat'd inside checkpointed layer calls,
+attention via differentiable `flash_attn_func` (D9 amendment: the
+inference kvcache op has no backward).
+
+**Gradient gate: PASS** (B=2, parity len 4, k=3). Functional path
+rerun is *bitwise* identical (deterministic at this shape); vs the
+naive reference (per-column sequential bottom, unbatched dual passes,
+visibility re-derived by column index, no checkpointing): loss
+rel-diff 6.9e-4, grad max-rel 1.67e-2 — bf16 kernel-order noise;
+semantic bugs sit O(0.5+). During construction the gate's design
+caught a real one: an early draft merged the refresh into the visible
+set before the first pass ran (same-snapshot violation) — in both
+paths identically, which is why the reference derives visibility
+independently by index. HF cross-check: the span drive with the row
+synced into the tied embedding matches the plain forward at
+mean|dlogit| 8.2e-2, top-1 1.0000 (G0-null scale).
+
+**Training smoke** (parity, dots+wire, 150 steps, B=64, k∈{1,2,4}):
+loss 29.4 → 1.7; emission CE 19.5 → ~0.01 and eval legality
+0.000 → 1.00 — the trained row fully claims the answer surface that
+the untrained baseline lacked entirely; answer CE settles at ~ln 2
+(calibrated-but-ignorant parity floor), accuracy still chance as
+expected at this scale. ~0.33 s/step eager; real runs want the D9
+compile pass.
+
 ## G0 — wire implementation correctness (2026-08-20)
 
 **Identity check: PASS.** Two-pass engine at α=0 vs plain HF forward,

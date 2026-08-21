@@ -247,6 +247,39 @@ comparisons are paired. Conditions: {none, wire, dots, dots+wire} + a
 `cot` topline; k sweeps the dots conditions only (D4: v0 fixed-k
 teacher-forced; the k-sweep is the money plot).
 
+**D12 — training path v0.** (2026-08-21, forks a9-ratified)
+**Think-first** (F1): the think scope trains first — cheapest serial
+span (k+1, not prompt+k+1), shortest credit-assignment chain, forced
+wire utilization; full scope follows. Structural note: the wire-alone
+cell of the 2×2 is inherently full-scope (without dots its think span
+is one position), so it joins at the full-scope run. **k sampled per
+batch** from the eval sweep set (F2), homogeneous within a batch.
+**lm_head over the whole emission span** (F3, a9's call — supersedes
+D9's answer-only line): the last prompt position and every dot target
+`<t>`, the last dot targets the answer. With sampled k this teaches a
+stopping *hazard* — D4's halting-by-sampling activates in v0. Loss is
+`CE(answer) + λ·mean(CE(emission))` so the task gradient is
+k-independent; dot targets carry no task content, so credit for the
+computation flows only through the answer term (H2 stays clean).
+Interior prompt positions stay unsupervised (detached hiddens, no
+surface signal). **Mixture is the goal, per-task the benchmark** (F4).
+Defaults: online fresh sampling (train seeds disjoint from the eval
+seed), full-vocab CE. Surface: fp32 masters — the `<t>` row (tied:
+synced into the model embedding for plain-forward arms) + the D2 gate
+MLP, zero-init output layer with logit biases so training starts at
+exactly α=0.1, β=0.9. *D9 amendment:* `flash_attn_with_kvcache` has
+no backward — the training path shares FA2 *kernels* via
+`flash_attn_func` over the functional cat'd cache, not the inference
+custom ops; K/V assembly happens inside the checkpointed layer calls
+so no assembled operand survives the forward. The gradient gate is
+null-calibrated (flash-attn's backward uses atomics; even the same
+path twice is not bitwise) and paired with an HF cross-check: the
+span drive with the row synced in must match the plain forward's
+answer logits within kernel noise. Recorded limitation: the CoT
+topline stays frozen — nothing is trainable under a frozen base, so
+it is the *in-context* legible reference, not a trace-supervised
+ceiling (that would need unfreezing; out of scope).
+
 ## Open
 
 - Reachability negatives are unconstrained; if shortcut heuristics
