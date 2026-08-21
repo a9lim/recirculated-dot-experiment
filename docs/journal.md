@@ -312,3 +312,27 @@ correlated with serial difficulty becomes a second wire-vs-no-wire
 discriminator. The forced k-sweep stays the training monitor; the
 running H2 jobs predate the readout, so their checkpoints get scored
 post hoc.
+
+## 2026-08-21 — First real runs: parity v0, an informative null
+
+Both arms ran clean at defaults from `8020e51` (wire ~50 min, dots
+~22 min, zero in-step compiles, exit 0). The monitor-while-working
+setup earned its keep twice over; annoyances for the next runner:
+detached stdout is block-buffered (evals surface ~1400 steps late —
+use PYTHONUNBUFFERED=1) and atomic checkpoint *replacement* keeps
+only final state (copy per eval point if trajectories matter).
+
+Result: accuracy chance everywhere, both arms, all k — H2 unresolved
+at 2000×512 and serial depth 32. But the post-hoc pass (sweep +
+gold_lp + D14 free running, untrained null, and a transfer cell) made
+it an informative null — full table in findings. The keeper: the
+wire-trained surface is *wire-dependent* — identical gold_lp across
+arms at k≤2, exactly where the wire is structurally invisible to the
+readout (refreshed columns reach a readout only from t=3; a live
+semantics cross-check), then collapse at k≥4 when the wire is removed
+(−0.72 → −3.7..−9.1, legality 1→0, halting 1→never). Both trained
+arms self-halt at k~4 with full legality against an untrained
+halt-immediately-illegally null, so D4's halting-by-sampling is real
+and measured. Everything *around* the computation trains; the
+computation didn't, yet. Next fork (a9's call): parity difficulty
+scaling vs longer runs.

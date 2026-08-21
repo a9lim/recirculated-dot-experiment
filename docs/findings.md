@@ -109,19 +109,63 @@ clock (38 graphs for dots+wire, 16 for dots, full default k set) and
 compiles nothing inside steps — the audit that enforces this caught
 two real warm-coverage holes at launch (journal 2026-08-21).
 
-## Training smoke (pre-scale sanity)
+## First H2 probe: parity at v0 scale (2026-08-21)
 
-Parity, dots+wire (think scope), 150 steps, B=64, k ∈ {1,2,4}: loss
-29.4 → 1.7; emission CE 19.5 → ~0.01 and eval legality 0.000 → 1.00 —
-the trained row fully claims the answer surface the untrained
-baseline lacked; answer CE settles at ~ln 2, the
-calibrated-but-ignorant parity floor, with accuracy still at chance
-as expected at this scale. The surface trains; whether the wire lets
-it *compute* is the first real run's question (H2).
+Both arms trained at defaults from `8020e51`: parity (length 32),
+think scope, 2000 steps × effective B=512 (~1M examples), k sampled
+uniformly from {1,2,4,8,16,32}, lr 1e-3, λ=1; wire arm ~50 min, dots
+~22 min, clean audits throughout. In-run eval sweeps: accuracy at
+chance every 500 steps in both arms. Post-hoc scoring of the final
+surfaces (n=512, eval seed 0; `logs/posthoc-parity.log` on jobe) —
+sweep with gold_lp plus the D14 free-running readout, against the
+untrained think-scope null and a transfer cell (wire-trained surface
+executed *without* the wire):
+
+| surface / arm | acc | legal (k≥4) | gold_lp (k≥4) | free-running (greedy) |
+|---|---|---|---|---|
+| untrained / either | chance | 0.000 | −9..−11 | halts at k=1, 0% legal |
+| **wire / think** | chance | 1.000 | **−0.72..−0.79** | halt 1.00, k~4, 100% legal |
+| **wire / dots** (transfer) | chance | 0.000 | −3.7..−9.1 | never halts |
+| dots / dots | chance | 1.000 | −0.72..−0.79 | halt 1.00, k~4, 100% legal |
+
+Readings:
+
+1. **H2 signal absent at this scale.** Accuracy is chance in every
+   trained cell; answer CE sits on the ln 2 calibrated-ignorance
+   floor (gold_lp ≈ −0.69). The surfaces learned everything *about*
+   answering — emission, calibration, stopping — and nothing about
+   parity.
+2. **The learned surface is wire-dependent** — the probe's genuinely
+   new fact. With the same wire-trained surface, gold_lp is identical
+   across wire/no-wire arms at k≤2 (−1.570/−1.586 — structurally
+   forced: the first refreshed column only becomes visible to a
+   readout at t=3, so this equality doubles as a live semantics
+   cross-check), then collapses without the wire at k≥4: −0.72 →
+   −3.7..−9.1, legality 1.0 → 0.0, greedy halting 100% → never. The
+   gate and row learned to keep the readout calibrated *through
+   recirculated state*, not through the row alone. Dependence, not
+   yet superiority: the dots-trained arm reaches the same floor
+   wire-free.
+3. **Halting works (D4/D14).** Both trained arms self-halt greedily
+   at k~4 with 100% legality (soft E[k|halt] ≈ 2.0–2.3), against an
+   untrained null that "halts" immediately on an illegal token.
+   Trained on uniform k, the learned hazard is front-loaded — the
+   forced-sweep legality zeros at k≤2 are this hazard seen from the
+   other side.
+
+Interpretation: the machinery is green end to end — gradients flow,
+the stopping hazard trains, the gate routes wire state — but the task
+computation did not emerge in 2000×512 at serial depth 32, which is
+the maximally hard depth for the k≤32 budget. Next probes, in order
+of information per GPU-hour: task-difficulty scaling (shorter parity
+lengths — a curriculum over difficulty, not trace supervision, so H3
+stays intact) and longer optimization.
 
 ## Next
 
-Real runs: parity dots+wire vs the dots-alone control (the H2
-learnability probe), then the remaining tasks per-task, then the
-mixture (F4), then full scope (brings the wire-alone arm and the
-α-migration readout).
+Parity difficulty scaling / longer runs (H2), then the remaining
+tasks per-task, the mixture (F4), and full scope (wire-alone arm +
+α-migration readout). Runner wishlist from this round:
+`PYTHONUNBUFFERED=1` in detached scripts, and per-eval checkpoint
+copies so soft-metric *trajectories* survive (atomic replace keeps
+only final state).
