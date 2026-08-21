@@ -161,11 +161,60 @@ of information per GPU-hour: task-difficulty scaling (shorter parity
 lengths — a curriculum over difficulty, not trace supervision, so H3
 stays intact) and longer optimization.
 
+## Parity length 4: first learned signal (2026-08-21)
+
+Difficulty-scaling probe: `--knobs length=4`, standard v0 recipe
+(flat LR, uniform k over {1..32}), both arms, 2000×512, snapshots
+every 500. Post-hoc at n=512 seed 0 (`logs/posthoc-parity4.log`,
+`logs/posthoc-parity4-transfer.log` on jobe). Three results:
+
+1. **The untrained baseline is not at chance at length 4.** Frozen
+   Gemma, forced choice: acc 0.568 at k=1 up to 0.631 at k=32
+   (SE ≈ 0.022) — with legality 0.00 and gold_lp −7..−10. The base
+   model carries parity-of-4-bits signal in its label-logit margins
+   while its output distribution is garbage. Every len-4 accuracy
+   must be read as Δ over the per-k untrained row, not over 0.5.
+2. **Wire-trained + wire-run beats that baseline; nothing else
+   does.** wire/think at step 2000: acc 0.568/0.568/0.629/0.752 at
+   k=4/8/16/32 (monotone in k), legality 1.00, and gold_lp −0.62 at
+   k=32 — the only cell above the ln 2 calibrated-ignorance floor
+   (~54% gold mass; argmax amplifies to 0.75). dots/dots matches the
+   *untrained* accuracy pattern with legality dressed on top and
+   gold_lp never above floor. Transfers fail both directions:
+   wire-trained scored wire-free collapses to the null (gold_lp
+   −3..−6); dots-trained given the wire *degrades* at high k.
+3. **The signal emerged entirely in steps 1500→2000** (k=32
+   trajectory: 0.486 → 0.492 → 0.492 → 0.752) — a late phase change
+   after ~1500 steps in the calibration/legality/hazard basin, cut
+   off mid-climb. Undertraining is confirmed, not just suspected.
+
+**No length transfer.** The step-2000 wire surface scored at lengths
+5/6/8: accuracy at the untrained null, gold_lp back *below* floor
+(−0.8..−2.1 — confidently miscalibrated off-distribution), legality
+partially collapsed. With 2⁴ = 16 distinct instances (B=512 sees the
+whole space ~32× per step — effectively full-batch GD), the learned
+solution is a length-4-specific lookup. The mechanism is still the
+point: the surface never sees the input except through recirculated
+hiddens, so even memorization certifies input-dependent routing
+through the wire — H2's mechanism at work, without H2's algorithm.
+
+Free-running texture: the trained wire arm greedily halts at k~3.8
+(100% legal, free acc 0.568 ≈ its forced k=4 accuracy) — it halts
+well before its own competence peak at k=32. The hazard trained on
+uniform k learned "halt around 4"; the capability lives at 32. That
+mismatch motivated D15's fat-tailed training k.
+
+Watch-items: legality at small k is *bistable* over training (both
+arms oscillate 0 ↔ 1.0 across evals under flat lr 1e-3) — any single
+eval's legality is a snapshot of that oscillation; and one stray
+transfer cell (dots at len5/k32: 0.637) has no k- or length-trend
+and awaits replication before it means anything.
+
 ## Next
 
-Parity difficulty scaling / longer runs (H2), then the remaining
-tasks per-task, the mixture (F4), and full scope (wire-alone arm +
-α-migration readout). Runner wishlist from this round:
-`PYTHONUNBUFFERED=1` in detached scripts, and per-eval checkpoint
-copies so soft-metric *trajectories* survive (atomic replace keeps
-only final state).
+Rerun parity4 under D15 (cosine to floor, train-k {2..32} with
+P∝k, longer budget) — does the phase change move earlier, stabilize,
+saturate; does transfer ever emerge (grokking watch). Then len 8/16
+with proper budgets (2⁸/2¹⁶ instances progressively close the
+memorization escape), the remaining tasks per-task, the mixture
+(F4), and full scope (wire-alone arm + α-migration readout).

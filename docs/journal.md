@@ -336,3 +336,58 @@ halt-immediately-illegally null, so D4's halting-by-sampling is real
 and measured. Everything *around* the computation trains; the
 computation didn't, yet. Next fork (a9's call): parity difficulty
 scaling vs longer runs.
+
+## 2026-08-21 — Parity length sweep: len 4 cracks, sweep cut short
+
+a9 ratified the difficulty-scaling fork; new runner flags (`--knobs`
+for per-run task knob overrides, `--snapshot-every` for immutable
+checkpoint copies, `f131a08`) made the sweep {4,8,16} × {wire,dots}
+a six-line script. Probed with `--steps 4`, launched detached ~16:26.
+
+parity4-wire replayed the len-32 script for three evals (floor
+calibration, oscillating legality) and then left chance at its final
+eval — the project's first off-chance accuracy. parity4-dots'
+training evals flickered above chance without cohering. When the
+control landed a9 called the stop; the runner and the just-started
+parity8-wire (pre-snapshot) were killed by hand — sweep-STATUS
+records the boundary. Lesson from the kill: `pkill -f` self-matches
+an ssh command string that contains the pattern; kill by pid.
+
+Post-hoc at n=512 turned the picture crisp (findings): the *frozen
+untrained* model is already above chance on len-4 forced choice
+(0.57–0.63 — label-logit margins with garbage outputs), so per-k
+untrained deltas are the only honest reference at this length; only
+wire-trained + wire-run beats that reference (0.752 at k=32, gold_lp
+−0.62 above the ln 2 floor — both readouts, only cell); the entire
+gain appeared in steps 1500→2000; and there is no length transfer —
+a length-4 lookup, but one necessarily implemented as input-dependent
+routing through the wire, since the surface has no other path to the
+input. At 16 instances and B=512 the run was effectively full-batch
+GD; the training-eval oscillation was optimizer dynamics, not noise.
+
+## 2026-08-21 — D15: the recipe stops being defaults
+
+Went over the training setup with a9, provenance by provenance: the
+execution half was measured (D13 knees, calibrated gates), the
+learning half never was — lr/λ/B/k-distribution were priors, `--steps
+2000` a round number, and flat-after-warmup was the one empirically
+grounded choice, inherited from the predecessor's curriculum lesson.
+The parity4 data indicted two of them directly: flat 1e-3 as the
+prime suspect for the bistable legality/late-phase-change dynamics,
+and uniform k for training a halt-at-4 hazard while competence sits
+at k=32 (plus 1/6 of steps spent at k=1, where no serial computation
+exists).
+
+D15 (a9's calls: cosine, whose stage lesson was always about resets,
+never the shape; no k=1 in training; fat tail): within-stage cosine
+to `--lr-floor` with `--cosine` period *independent of the run
+length* — lr is a pure function of the within-run step (warmup →
+one cosine period → flat at the floor), so a run can end mid-cosine
+or coast, stages reset by being separate runs, and exact resume
+carries no schedule state. Training k decouples from the eval sweep:
+`--train-k` (default {2..32}) weighted P(k) ∝ k^γ (`--k-gamma`,
+default 1 → E[k]≈22, ~52% of steps at k=32). k=1 stays in the eval
+sweep as the structural-invariance probe. Deliberately *not* taken
+now: λ-per-k. Note: the (task,k) schedule stream changed, so
+resuming pre-D15 checkpoints under new defaults would silently alter
+their schedule — fresh runs only across this boundary.
