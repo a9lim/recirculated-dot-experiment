@@ -263,6 +263,20 @@ AttentionInterface.register("wire_attention", _wire_attention)
 AttentionMaskInterface.register("wire_attention", flash_attention_mask)
 
 
+def load_model(name: str = "google/gemma-3-1b-pt", device: str = "cuda"):
+    """The canonical loading convention (D10 addendum): half precision,
+    attn_implementation="wire_attention", eval mode — baselines and the
+    engine share kernels from the first forward on."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(name)
+    model = AutoModelForCausalLM.from_pretrained(
+        name, dtype=torch.bfloat16, attn_implementation="wire_attention"
+    )
+    model.to(device).eval()
+    return tok, model
+
+
 @dataclass
 class WireConfig:
     source: int = 11
@@ -471,6 +485,9 @@ class RecirculationEngine:
         return self._rope
 
     def mix(self, h_s: Tensor, h_d: Tensor, alpha, beta) -> Tensor:
+        # Eq. 1 (norm-matched mix). Semantic twin of train._mix — keep
+        # them in sync. Deliberate dtype split: bf16 here (compiled hot
+        # path), fp32 there (gate outputs are fp32 masters).
         ratio = h_d.norm(dim=-1, keepdim=True) / h_s.norm(
             dim=-1, keepdim=True
         ).clamp_min(self.cfg.eps)

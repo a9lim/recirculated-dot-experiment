@@ -106,6 +106,9 @@ class Surface(nn.Module):
 
 
 def _mix(cfg_eps: float, h_s: Tensor, h_d: Tensor, alpha, beta) -> Tensor:
+    # Eq. 1 (norm-matched mix). Semantic twin of RecirculationEngine.mix
+    # in wire.py — keep them in sync. Deliberate dtype split: fp32 here
+    # (gate outputs are fp32 masters), bf16 there (compiled hot path).
     ratio = h_d.norm(dim=-1, keepdim=True) / h_s.norm(dim=-1, keepdim=True).clamp_min(
         cfg_eps
     )
@@ -431,10 +434,10 @@ def _grad_diff(a: dict[str, Tensor], b: dict[str, Tensor]) -> float:
 
 def gate_mode(args) -> None:
     """The D9 gradient gate + an HF cross-check of the span drive."""
-    from .g0 import load_model
+    from .wire import load_model
 
     tok, model = load_model(args.model, "cuda")
-    dot_id = tasks._single(tok, tasks.DOT)
+    dot_id = tasks.single_token(tok, tasks.DOT)
     surface = Surface(model, dot_id).cuda()
     inst = tasks.sample(tasks.TASKS["parity"], 2, 7, length=4)
     rows = [tasks.encode(tok, i, "dots", 3) for i in inst]
@@ -497,10 +500,10 @@ def evaluate_sweep(model, surface, tok, task, k_set, n, condition, source, dest,
 
 
 def run_mode(args) -> None:
-    from .g0 import load_model
+    from .wire import load_model
 
     tok, model = load_model(args.model, "cuda")
-    dot_id = tasks._single(tok, tasks.DOT)
+    dot_id = tasks.single_token(tok, tasks.DOT)
     surface = Surface(model, dot_id).cuda()
     opt = torch.optim.AdamW(surface.parameters(), lr=args.lr, weight_decay=0.0)
     task_list = args.tasks.split(",")

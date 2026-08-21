@@ -91,7 +91,7 @@ class Encoded:
     think: tuple[int, int]  # [start, end) of the think span within ids
 
 
-def _single(tok, text: str) -> int:
+def single_token(tok, text: str) -> int:
     ids = tok(text, add_special_tokens=False).input_ids
     if len(ids) != 1:
         raise ValueError(f"{text!r} must be one token, got {ids}")
@@ -111,7 +111,7 @@ def encode(tok, inst: Instance, think: str = "none", k: int = 0) -> Encoded:
     ids = tok(prompt).input_ids  # BOS via the tokenizer's default specials
     start = len(ids)
     if think == "dots":
-        ids = ids + [_single(tok, DOT)] * k
+        ids = ids + [single_token(tok, DOT)] * k
     elif think == "cot":
         trace = render_cot(inst)
         if trace is None:
@@ -120,8 +120,8 @@ def encode(tok, inst: Instance, think: str = "none", k: int = 0) -> Encoded:
             ids = ids + tok(state, add_special_tokens=False).input_ids
     elif think != "none":
         raise ValueError(f"unknown think mode {think!r}")
-    label_ids = tuple(_single(tok, s) for s in label_space(inst))
-    answer_id = _single(tok, answer)
+    label_ids = tuple(single_token(tok, s) for s in label_space(inst))
+    answer_id = single_token(tok, answer)
     if answer_id != label_ids[inst.label]:
         raise ValueError(f"answer {answer!r} disagrees with label {inst.label}")
     return Encoded(tuple(ids), answer_id, int(inst.label), label_ids, (start, len(ids)))
@@ -190,8 +190,7 @@ def main() -> None:
     p.add_argument("--ramp", type=int, default=10)
     args = p.parse_args()
 
-    from .g0 import load_model
-    from .wire import RecirculationEngine, WireConfig
+    from .wire import RecirculationEngine, WireConfig, load_model
 
     tok, model = load_model(args.model, "cuda")
     engine = RecirculationEngine(

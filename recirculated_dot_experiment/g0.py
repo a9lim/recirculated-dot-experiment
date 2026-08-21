@@ -25,7 +25,7 @@ import time
 
 import torch
 
-from .wire import RecirculationEngine, WireConfig
+from .wire import RecirculationEngine, WireConfig, load_model
 
 # emozilla/pg19 is the parquet mirror; deepmind/pg19 is script-based, which
 # datasets >= 5 refuses to load.
@@ -33,19 +33,6 @@ DATASETS = {
     "pg19": ("emozilla/pg19", None, "test", "text"),
     "c4": ("allenai/c4", "en", "validation", "text"),
 }
-
-
-def load_model(name: str, device: str):
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    tok = AutoTokenizer.from_pretrained(name)
-    # wire_attention (registered at wire import): FA2 everywhere, so the
-    # baselines run the same kernels before and after engine construction
-    model = AutoModelForCausalLM.from_pretrained(
-        name, dtype=torch.bfloat16, attn_implementation="wire_attention"
-    )
-    model.to(device).eval()
-    return tok, model
 
 
 def collect_windows(dataset: str, tok, n_windows: int, win_len: int, per_doc: int):
