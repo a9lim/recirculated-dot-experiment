@@ -524,3 +524,15 @@ Largest-first static preparation captures the useful lifecycle gain without
 changing the canonical numerical path. Sweep construction is now shared by
 the task CLI and periodic training evaluation through one `encode_dot_sweep`
 helper in `tasks`; no fourth generic utilities module was introduced.
+
+Final implemented gates: Ruff and all 10 project tests pass on Jobe; the
+zero-init and perturbed gradient gate remains at 2.271e-2/5.176e-2 relative
+gradient difference with HF top-1 1.000; G0 identity is unchanged at mean
+|dlogit| 5.80e-2, top-1 0.9746, and ppl 27.0229→27.0575. The 100x512
+reproduction remains PG19 **+9.00%** and C4 **+5.09%**, each 2.13 s with
+zero timed recompiles. The real B=512 two-condition task pass prepared T=137
+in 5.50 s (four graphs) and completed all eight prefill lengths at 11 total
+graphs under Dynamo's default guard. A B=512,k=8 optimizer smoke step warmed
+14 graphs outside timing, triggered none in the step, and retained the prior
+13.07 GiB peak. An all-condition four-task smoke pass likewise completed under
+the restored guard.
