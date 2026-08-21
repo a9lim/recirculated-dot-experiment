@@ -10,19 +10,11 @@ from recirculated_dot_experiment.train import (
     GateMLP,
     PromptStateCache,
     Surface,
-    _checkpoint_for,
     _execution_plan,
     _gate_mix_math,
     _mix,
     _step_choice,
 )
-
-
-def test_checkpoint_policy_uses_measured_memory_knee():
-    assert not _checkpoint_for("auto", 256, 8)
-    assert _checkpoint_for("auto", 512, 8)
-    assert _checkpoint_for("always", 1, 1)
-    assert not _checkpoint_for("never", 4096, 32)
 
 
 def test_execution_plan_keeps_effective_batch_and_compiled_shapes():

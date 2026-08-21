@@ -173,11 +173,12 @@ gates green (identity inside the null; PG19 −8.93%, C4 −5.03%,
 5 s/3 s).
 
 *CUDA compilation addendum (same day, a9 ratified).* Compile every
-tensor-heavy region that has a stable semantic boundary: packed-QKV /
-packed-gate-up pass A, the first slab step, recurrent mix+slab, and
-chunked readout. The outer position loop remains the authoritative
-Python state machine because it advances and commits the mutable dual
-cache; it performs no model math. Pass A always uses one compiled B=64
+tensor-heavy region that has a stable semantic boundary and a measured
+win: packed-QKV / packed-gate-up pass A, the first slab step, recurrent
+mix+slab, and fused chunked NLL. The logits-only BF16 head remains eager;
+its library GEMM does not amortize a separate graph. The outer position
+loop remains the authoritative Python state machine because it advances
+and commits the mutable dual cache; it performs no model math. Pass A always uses one compiled B=64
 signature, padding only its final chunk and writing each result directly
 into pooled destination-state storage. The original Q/K/V and gate/up
 Parameters are disjoint views of their packed tensors; state-dict export
@@ -208,6 +209,13 @@ discarded before scoring. Readout scratch similarly pads its final chunk,
 so the default NLL path has five compiled graphs total rather than a
 sixth tail-shape variant. Persistent Inductor caching is used normally;
 no run clears it except an explicit cold-start benchmark.
+
+Task evaluation prepares its longest configured full-wire input before
+scoring. This establishes the largest cache backing and steady CUDA graph
+once, preventing later prompt growth from recompiling cache-dependent slab
+signatures. The current max-k sweep visits at most eight prefill lengths, so
+Dynamo's normal per-frame recompile guard remains intact; no package import
+globally weakens it.
 
 Store the two attention branches by their mathematical decomposition,
 not as duplicated histories. Both queries read one physical refreshed
@@ -279,9 +287,10 @@ ceiling (that would need unfreezing; out of scope).
 the base before any graph exists. Q/K/V and gate/up projections are
 packed once and the original Parameters become disjoint views of that
 storage; prompt prefill, parallel span, and serial layer math share
-regional `torch.compile(fullgraph)` functions. The adaptive gate/mix and
-final Gemma norm are tensor-only compiled regions as well. At a recurrent step,
-refresh and first-pass tokens are projected together and attend through
+regional `torch.compile(fullgraph)` functions. Adaptive gate/mix and the
+standalone final norm/concatenation stay eager: isolated compilation was
+whole-step neutral and added several seconds of cold setup. At a recurrent
+step, refresh and first-pass tokens are projected together and attend through
 one differentiable `flash_attn_varlen_func` call with per-branch lengths.
 The persistent functional cache stays piecewise; prefix concatenation
 lives inside non-reentrant checkpoint recomputation with RNG preservation

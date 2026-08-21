@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -37,6 +38,22 @@ def test_scopes_are_explicitly_named():
     assert tasks.CONDITIONS["dots+think-wire"] == ("dots", "think")
     assert tasks.CONDITIONS["dots+full-wire"] == ("dots", "full")
     assert "dots+wire" not in tasks.CONDITIONS
+
+
+def test_encode_dot_sweep_reuses_instances_across_budgets():
+    tok = CharacterTokenizer()
+    instances = tasks.sample(tasks.TASKS["parity"], 3, 19, length=4)
+    encoded = tasks.encode_dot_sweep(tok, instances, [1, 2, 4])
+
+    assert list(encoded) == [1, 2, 4]
+    assert [len(row.ids) for row in encoded[4]] == [
+        len(row.ids) + 3 for row in encoded[1]
+    ]
+    assert [[row.label for row in encoded[k]] for k in encoded] == [
+        [instance.label for instance in instances]
+    ] * 3
+    with pytest.raises(ValueError, match="positive k"):
+        tasks.encode_dot_sweep(tok, instances, [])
 
 
 class ToyInner(nn.Module):

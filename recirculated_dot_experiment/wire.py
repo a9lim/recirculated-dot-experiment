@@ -92,14 +92,6 @@ from transformers.models.gemma3.modeling_gemma3 import apply_rotary_pos_emb
 
 _PREFILL_BATCH = 64
 
-# Per-shape specialization is the canon (D10): every distinct T compiles
-# its own graph, and a task grid (D11) legitimately visits dozens of
-# prompt+k lengths. Dynamo's default guardrail (8 recompiles per frame,
-# a hard abort under fullgraph) would kill such a grid mid-run; the
-# guard we actually rely on against *accidental* recompiles is G0's
-# unique-graph audit over timed evaluation.
-torch._dynamo.config.recompile_limit = 256
-
 
 def _clone_packed_state_dict_views(module, state_dict, prefix, local_metadata) -> None:
     """Give serializers independent tensors without retaining them at runtime."""
@@ -469,14 +461,15 @@ class RecirculationEngine:
             self._gate_up_weights,
         ) = pack_model_projections(model)
 
-        # Compile every tensor-heavy region. The outer position loop remains
-        # the small state machine that advances views into the mutable cache.
+        # Compile tensor-heavy regions with measured wins. The outer position
+        # loop remains the small state machine that advances views into the
+        # mutable cache; the logits-only head stays eager because its GEMM is
+        # already library-dispatched and compilation does not amortize.
         compile_kw = {"fullgraph": True, "dynamic": False}
         self._prefill_c = torch.compile(self._prefill, **compile_kw)
         self._slab_first_c = torch.compile(self._slab, **compile_kw)
         self._step_c = torch.compile(self._step, **compile_kw)
         self._nll_chunk_c = torch.compile(self._nll_chunk, **compile_kw)
-        self._logits_chunk_c = torch.compile(self._logits_chunk, **compile_kw)
         self._nll_from_logits_c = torch.compile(self._nll_from_logits, **compile_kw)
 
     def _ensure_rope(
@@ -874,7 +867,7 @@ class RecirculationEngine:
 
         if return_logits:
             for i in range(0, padded_len, chunk):
-                lg = self._logits_chunk_c(cache.tops[:, i : i + chunk])
+                lg = self._logits_chunk(cache.tops[:, i : i + chunk])
                 logits.append(lg)
                 nlls.append(
                     self._nll_from_logits_c(lg, cache.readout_targets[:, i : i + chunk])
@@ -904,12 +897,12 @@ class RecirculationEngine:
             [start + k - 1 for k in ks], device=input_ids.device, dtype=torch.long
         )
         cache = self._run(input_ids, None)
-        return cache.tops.index_select(1, positions).clone()
+        return cache.tops.index_select(1, positions)
 
     @torch.inference_mode()
     def logits_from_hidden(self, hidden: Tensor) -> Tensor:
-        """Compiled BF16 head for a raw top state returned by a sweep."""
-        return self._logits_chunk_c(hidden.unsqueeze(1)).squeeze(1)
+        """BF16 head for a raw top state returned by a sweep."""
+        return self._logits_chunk(hidden.unsqueeze(1)).squeeze(1)
 
     @torch.inference_mode()
     def answer_logits(self, input_ids: Tensor, alpha_fn=None) -> Tensor:
@@ -918,8 +911,8 @@ class RecirculationEngine:
         The task readout (design.md D3/D4): the last think token predicts
         the answer, so forced-choice scoring needs exactly one position —
         no per-dot NLL is ever computed, mirroring D9's answer-only
-        supervision. Same tops and compiled head as teacher_forced_logits'
-        last column, at chunk width 1."""
+        supervision. Same tops and BF16 head as teacher_forced_logits' last
+        column, at chunk width 1."""
         T = input_ids.shape[1]
         cache = self._run(input_ids, alpha_fn)
-        return self._logits_chunk_c(cache.tops[:, T - 1 : T]).squeeze(1)
+        return self._logits_chunk(cache.tops[:, T - 1 : T]).squeeze(1)

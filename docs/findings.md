@@ -308,11 +308,11 @@ D11 landed: id-space composition over the shared generators, pinned
 single-token surfaces (reachability at nodes=10 — "10"/"11" split into
 digit pairs), forced-choice readout via the engine's new
 `answer_logits` (identity gate re-passed at the recorded numbers after
-the `_run` extraction — pure code motion). One Dynamo guardrail
-raised: `recompile_limit` 8 → 256. A task grid's ~30 distinct lengths
-are deliberate per-shape compiles, and the default limit hard-aborts
-under fullgraph at the 9th shape (hit mid-grid at parity T=69);
-accidental-recompile protection remains G0's unique-graph audit.
+the `_run` extraction — pure code motion). At this stage one Dynamo
+guardrail was raised: `recompile_limit` 8 → 256. The then-standalone task
+grid visited ~30 distinct lengths, and the default limit hard-aborted under
+fullgraph at the 9th shape (hit mid-grid at parity T=69). The later max-k
+sweep and hindsight pass supersede this global change.
 
 Full untrained grid (historical full-scope labels: 4 tasks × {none,
 wire, dots, dots+wire} + cot,
@@ -463,14 +463,15 @@ useful canonical change; manual whole-step CUDA graphs did not.
    compiled head was live, so the safe all-layer plan remains authoritative.
    Checkpoint calls no longer preserve CUDA RNG state because the captured
    region contains no stochastic operation.
-3. **Compiled adaptive surface.** Gate MLP, sigmoid alpha/beta, norm-matched
-   mixing, final RMSNorm, packed decoder math, and train CE are now regional
-   fullgraph compilations. Gate/mix was whole-step neutral at B=256,k=8
+3. **Compiled adaptive surface (historical candidate).** Gate MLP, sigmoid
+   alpha/beta, norm-matched mixing, final RMSNorm, packed decoder math, and
+   train CE were made regional fullgraph compilations. Gate/mix was whole-step neutral at B=256,k=8
    (**530.4 ms compiled vs 531.6 ms eager**) but eliminates the last material
    trainable pointwise island; the mandatory zero-init and perturbed-surface
    gradient gate still passes. Compiling the standalone eval readout was
    rejected (**3.535 vs 3.517 ms**) and fused AdamW was also rejected for this
-   small parameter list (**0.283 vs 0.112 ms**).
+   small parameter list (**0.283 vs 0.112 ms**). The hindsight pass below
+   retains the decoder/CE wins and retires the three tiny boundaries.
 4. **Frozen prompt-state cache.** Repeated task evaluations share a bounded
    packed BF16 pinned-host LRU. On parity B=256, its entry is 0.432 GiB. After
    warming both tensor layouts outside timing, a compiled k=32 sweep segment
@@ -487,3 +488,39 @@ ordering constraints disproportionate to the measured gain. The manual graph
 path was therefore not implemented. Profiler attribution (42.9% GEMM, 30.8%
 FA2 backward; task heads 3.0% of max-k evaluation) likewise gave no case for
 installing an external kernel package.
+
+## Cross-module compile hindsight pass (2026-08-21)
+
+Compilation was re-audited region by region after the wire, training, and
+max-k evaluation paths had reached their current form. The heavy wire regions
+remain clear wins on the RTX 4090: prefill 111.54 → 63.32 ms, first slab
+10.06 → 2.60 ms, recurrent step 12.11 → 4.73 ms, two-key merge 0.186 →
+0.051 ms, and fused NLL 6.16 → 3.25 ms. The manual steady graph also remains
+canonical: 6.6% faster at B=128 and 1.1–1.8% at B=512 with no measured peak
+memory increase.
+
+Two smaller compilation classes did not pay. The wire's logits-only B=512
+head saved 0.023 ms per call but cost 1.01 s from an empty cache, a roughly
+44,000-call break-even; it is now eager while fused NLL remains compiled.
+Training's adaptive gate/mix, standalone final norm, and final norm+concat
+cost 4.44 s cold together while changing a complete B=256,k=8 step by less
+than 0.2%; the two norm boundaries were individually slower compiled. Those
+three regions are now eager, while packed decoder layers and fused CE remain
+compiled.
+
+Max-k evaluation reduced the default full-wire task grid to exactly eight
+prefill lengths. The old process-global `recompile_limit=256` is therefore
+retired; the exact current sequence passes Dynamo's default limit. More
+importantly, preparing its longest T=137 input first prevents the cache growth
+from T=105 from recompiling cache-dependent slabs. With empty Inductor caches,
+the complete preparation sequence fell from 59.29 to 42.08 s and 15 to 12
+graphs at B=64; at the canonical B=512 it fell from 65.18 to **49.40 s**
+(−24.2%), again 15 to 12 graphs, despite the explicit extra warmup execution.
+
+Dynamic prefill was rejected in favor of this ordering fix. It collapsed
+four task prefill shapes to one graph and shifted PG19/C4 perplexity only
++0.051%/+0.025%, but changed several n=64 forced-choice cells by one example.
+Largest-first static preparation captures the useful lifecycle gain without
+changing the canonical numerical path. Sweep construction is now shared by
+the task CLI and periodic training evaluation through one `encode_dot_sweep`
+helper in `tasks`; no fourth generic utilities module was introduced.

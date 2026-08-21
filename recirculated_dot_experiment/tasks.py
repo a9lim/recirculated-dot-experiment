@@ -39,6 +39,7 @@ Run: python -m recirculated_dot_experiment.tasks [--tasks ..] [--k ..]
 from __future__ import annotations
 
 import argparse
+import time
 from dataclasses import dataclass
 
 import torch
@@ -126,6 +127,15 @@ def encode(tok, inst: Instance, think: str = "none", k: int = 0) -> Encoded:
     if answer_id != label_ids[inst.label]:
         raise ValueError(f"answer {answer!r} disagrees with label {inst.label}")
     return Encoded(tuple(ids), answer_id, int(inst.label), label_ids, (start, len(ids)))
+
+
+def encode_dot_sweep(
+    tok, instances: list[Instance], ks: list[int]
+) -> dict[int, list[Encoded]]:
+    """Encode one shared instance set at every requested positive dot budget."""
+    if not ks or min(ks) < 1:
+        raise ValueError("dot sweeps require positive k")
+    return {k: [encode(tok, instance, "dots", k) for instance in instances] for k in ks}
 
 
 def _score(logits: torch.Tensor, group: list[Encoded], sums: dict) -> None:
@@ -260,19 +270,54 @@ def main() -> None:
     dots_engine = DotsAdapter(model, surface, prompt_cache)
     think_engine = ThinkAdapter(model, surface, args.source, args.dest, prompt_cache)
     ks = [int(s) for s in args.k.split(",")]
+    task_names = args.tasks.split(",")
+    conditions = args.conditions.split(",")
+    instances_by_task = {
+        task: sample(TASKS[task], args.n, args.seed, **KNOBS[task])
+        for task in task_names
+    }
 
-    for task in args.tasks.split(","):
-        instances = sample(TASKS[task], args.n, args.seed, **KNOBS[task])
+    # Establish the largest full-wire cache backing first. The default grid's
+    # first scored full-wire condition is shorter than its later max-k sweep;
+    # letting that later call grow the cache recompiles the slab signatures and
+    # recaptures the steady graph. One untimed longest-shape preparation keeps
+    # those backing shapes stable while per-T prefill specialization remains.
+    full_rows = []
+    for task in task_names:
+        instance = instances_by_task[task][0]
+        for condition in conditions:
+            think, scope = CONDITIONS[condition]
+            if scope != "full":
+                continue
+            if think == "cot" and render_cot(instance) is None:
+                continue
+            k = max(ks) if think in {"dots", "cot"} else 0
+            full_rows.append(encode(tok, instance, think, k))
+    if full_rows:
+        warm = max(full_rows, key=lambda row: len(row.ids))
+        ids = torch.tensor([warm.ids] * args.batch, device="cuda")
+        before = int(torch._dynamo.utils.counters["stats"]["unique_graphs"])
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        full_engine.answer_logits(ids)
+        torch.cuda.synchronize()
+        after = int(torch._dynamo.utils.counters["stats"]["unique_graphs"])
+        print(
+            f"full-wire prepare B={args.batch} T={len(warm.ids)}  "
+            f"{time.perf_counter() - started:.2f}s outside evaluation  "
+            f"({after - before} graphs)"
+        )
+
+    for task in task_names:
+        instances = instances_by_task[task]
         chance = 1 / len(label_space(instances[0]))
         print(f"\n{task} (n={args.n}, chance {chance:.2f})")
-        for cond in args.conditions.split(","):
+        for cond in conditions:
             think, scope = CONDITIONS[cond]
             if think == "cot" and render_cot(instances[0]) is None:
                 continue
             if think == "dots":
-                rows_by_k = {
-                    k: [encode(tok, inst, think, k) for inst in instances] for k in ks
-                }
+                rows_by_k = encode_dot_sweep(tok, instances, ks)
                 runner = {
                     "plain": dots_engine,
                     "full": full_engine,

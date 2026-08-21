@@ -122,12 +122,9 @@ def _gate_mix_math(
     return beta * h_d + alpha * ratio * h_s
 
 
-_gate_mix_c = torch.compile(_gate_mix_math, fullgraph=True, dynamic=True)
-
-
 def _gate_mix(gate: GateMLP, h_s: Tensor, h_d: Tensor, eps: float = 1e-6) -> Tensor:
-    """Compiled adaptive-alpha surface used by the functional train path."""
-    return _gate_mix_c(
+    """Adaptive-alpha surface used by the functional train path."""
+    return _gate_mix_math(
         eps,
         h_s,
         h_d,
@@ -340,7 +337,6 @@ def _dual_layer_math(
 
 _single_layer_c = torch.compile(_single_layer_math, fullgraph=True, dynamic=True)
 _dual_layer_c = torch.compile(_dual_layer_math, fullgraph=True, dynamic=True)
-_final_norm_c = torch.compile(_rms_norm, fullgraph=True, dynamic=True)
 
 
 def _finish_outputs_math(
@@ -353,9 +349,6 @@ def _finish_outputs_math(
         (prompt_hidden, _rms_norm(dot_hidden, norm_weight, eps)),
         dim=1,
     )
-
-
-_finish_outputs_c = torch.compile(_finish_outputs_math, fullgraph=True, dynamic=True)
 
 
 def _dual_layer_from_pieces(
@@ -471,7 +464,7 @@ def _prompt_prefill(model, packed, prompt_ids: Tensor):
             True,
         )
         kv.append((k, v))
-    return _final_norm_c(x[:, -1:], model.model.norm.weight, model.model.norm.eps), kv
+    return _rms_norm(x[:, -1:], model.model.norm.weight, model.model.norm.eps), kv
 
 
 @dataclass
@@ -759,7 +752,7 @@ def think_outputs(
         frontier = {i: first_kv[j] for j, i in enumerate(slab)}
         tops.append(x1)
         h_s_prev = h_s
-    return _finish_outputs_c(
+    return _finish_outputs_math(
         h_init,
         torch.cat(tops, dim=1),
         model.model.norm.weight,
@@ -800,7 +793,7 @@ def parallel_outputs(
         model.config.num_hidden_layers,
         ckpt,
     )
-    return _finish_outputs_c(
+    return _finish_outputs_math(
         h_init,
         x,
         model.model.norm.weight,
@@ -1081,17 +1074,6 @@ def _loss_and_grads(loss_fn, surface: Surface) -> tuple[float, dict[str, Tensor]
     return float(loss.detach()), _grads(loss, surface)
 
 
-def _checkpoint_for(policy: str, batch: int, k: int) -> bool:
-    """Compatibility predicate for the measured RTX 4090 memory knee."""
-    if policy == "always":
-        return True
-    if policy == "never":
-        return False
-    if policy != "auto":
-        raise ValueError(f"unknown checkpoint policy {policy!r}")
-    return batch * k > 2048
-
-
 CheckpointSpec = bool | frozenset[int]
 
 
@@ -1247,10 +1229,7 @@ def evaluate_sweep(
         )
     if rows is None:
         instances = tasks.sample(tasks.TASKS[task], n, 0, **tasks.KNOBS[task])
-        rows = {
-            k: [tasks.encode(tok, instance, "dots", k) for instance in instances]
-            for k in k_set
-        }
+        rows = tasks.encode_dot_sweep(tok, instances, k_set)
     results = tasks.evaluate_dot_sweep(model, rows, runner, min(batch, n))
     return {k: (result["acc"], result["legal"]) for k, result in results.items()}
 
@@ -1433,10 +1412,7 @@ def run_mode(args) -> None:
                 0,
                 **tasks.KNOBS[task_name],
             )
-            eval_rows[task_name] = {
-                k: [tasks.encode(tok, instance, "dots", k) for instance in instances]
-                for k in k_set
-            }
+            eval_rows[task_name] = tasks.encode_dot_sweep(tok, instances, k_set)
     start_step = 1
     if args.resume is not None:
         resume_path = args.out if args.resume == "auto" else args.resume
