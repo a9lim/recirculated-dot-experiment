@@ -246,7 +246,7 @@ def main() -> None:
     p.add_argument("--ramp", type=int, default=10)
     args = p.parse_args()
 
-    from .train import DotsAdapter, Surface, ThinkAdapter
+    from .train import DotsAdapter, PromptStateCache, Surface, ThinkAdapter
     from .wire import RecirculationEngine, WireConfig, load_model
 
     tok, model = load_model(args.model, "cuda")
@@ -256,8 +256,11 @@ def main() -> None:
     )
     dot_id = single_token(tok, DOT)
     surface = Surface(model, dot_id)
-    dots_engine = DotsAdapter(model, surface)
-    think_engine = ThinkAdapter(model, surface, args.source, args.dest)
+    prompt_cache = PromptStateCache(model)
+    dots_engine = DotsAdapter(model, surface, prompt_cache)
+    think_engine = ThinkAdapter(
+        model, surface, args.source, args.dest, prompt_cache
+    )
     ks = [int(s) for s in args.k.split(",")]
 
     for task in args.tasks.split(","):

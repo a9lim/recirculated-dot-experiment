@@ -58,6 +58,7 @@ import gc
 import math
 import random
 import time
+from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -457,6 +458,85 @@ def _prompt_prefill(model, packed, prompt_ids: Tensor):
     return model.model.norm(x[:, -1:]), kv
 
 
+@dataclass
+class _PromptCacheEntry:
+    tensors: tuple[Tensor, ...]
+    ready: torch.cuda.Event
+    nbytes: int
+
+
+class PromptStateCache:
+    """Pinned-host LRU for frozen prompt hiddens and per-layer KV.
+
+    The prompt excludes `<t>`, so its state is invariant while the surface
+    trains. A dedicated stream overlaps the one-time D2H fill with the serial
+    dot computation; later evaluations copy the compact BF16 state back.
+    """
+
+    def __init__(self, model, max_bytes: int = 8 * 2**30):
+        self.model = model
+        self.max_bytes = max_bytes
+        self.bytes = 0
+        self.hits = 0
+        self.misses = 0
+        self.entries: OrderedDict[tuple, _PromptCacheEntry] = OrderedDict()
+        self.stream = torch.cuda.Stream(device=next(model.parameters()).device)
+
+    @staticmethod
+    def _flatten(state) -> tuple[Tensor, ...]:
+        hidden, kv = state
+        return (hidden, *(tensor for pair in kv for tensor in pair))
+
+    @staticmethod
+    def _unflatten(tensors: tuple[Tensor, ...]):
+        return tensors[0], list(zip(tensors[1::2], tensors[2::2]))
+
+    def _key(self, ids: Tensor, start: int) -> tuple:
+        prompt = ids[:, :start]
+        # Evaluation input construction starts on CPU, but the adapter API is
+        # device-facing. This small ID copy is negligible beside prompt KV.
+        return prompt.shape, tuple(prompt.reshape(-1).tolist())
+
+    @torch.no_grad()
+    def get(self, ids: Tensor, start: int):
+        key = self._key(ids, start)
+        entry = self.entries.pop(key, None)
+        current = torch.cuda.current_stream(ids.device)
+        if entry is not None:
+            self.hits += 1
+            self.entries[key] = entry
+            current.wait_event(entry.ready)
+            tensors = tuple(
+                tensor.to(ids.device, non_blocking=True) for tensor in entry.tensors
+            )
+            return self._unflatten(tensors)
+
+        self.misses += 1
+        state = _prompt_prefill(
+            self.model,
+            pack_model_projections(self.model),
+            ids[:, :start],
+        )
+        source = self._flatten(state)
+        host = tuple(
+            torch.empty_like(tensor, device="cpu", pin_memory=True) for tensor in source
+        )
+        with torch.cuda.stream(self.stream):
+            self.stream.wait_stream(current)
+            for target, tensor in zip(host, source):
+                target.copy_(tensor, non_blocking=True)
+                tensor.record_stream(self.stream)
+            ready = self.stream.record_event()
+        nbytes = sum(tensor.numel() * tensor.element_size() for tensor in host)
+        self.entries[key] = _PromptCacheEntry(host, ready, nbytes)
+        self.bytes += nbytes
+        while self.bytes > self.max_bytes and len(self.entries) > 1:
+            _, evicted = self.entries.popitem(last=False)
+            evicted.ready.synchronize()
+            self.bytes -= evicted.nbytes
+        return state
+
+
 def _pe(rope, layer_types, i, sl=None):
     cos, sin = rope[layer_types[i]]
     return (cos, sin) if sl is None else (cos[:, sl], sin[:, sl])
@@ -557,6 +637,7 @@ def think_outputs(
     source: int,
     dest: int,
     ckpt: bool = True,
+    prompt_state=None,
 ) -> Tensor:
     """Think-scope wire forward. Returns supervised hiddens [B, k+1, d]
     (post final-norm): last prompt position, then every dot top."""
@@ -565,7 +646,11 @@ def think_outputs(
     dtype = model.model.embed_tokens.weight.dtype
     packed = pack_model_projections(model)
     scale = float(model.config.hidden_size) ** 0.5
-    h_init, prompt_kv = _prompt_prefill(model, packed, ids[:, :P])
+    h_init, prompt_kv = (
+        _prompt_prefill(model, packed, ids[:, :P])
+        if prompt_state is None
+        else prompt_state
+    )
 
     positions = torch.arange(P, T, device=ids.device)
     span_rope = _rope(model, positions, dtype)
@@ -634,6 +719,7 @@ def parallel_outputs(
     ids: Tensor,
     span_start: int,
     ckpt: bool = True,
+    prompt_state=None,
 ) -> Tensor:
     """Dots-alone forward: the same span drive through ALL layers, no
     wire. Returns supervised hiddens [B, k+1, d], post final-norm."""
@@ -642,7 +728,11 @@ def parallel_outputs(
     dtype = model.model.embed_tokens.weight.dtype
     packed = pack_model_projections(model)
     scale = float(model.config.hidden_size) ** 0.5
-    h_init, prompt_kv = _prompt_prefill(model, packed, ids[:, :P])
+    h_init, prompt_kv = (
+        _prompt_prefill(model, packed, ids[:, :P])
+        if prompt_state is None
+        else prompt_state
+    )
     positions = torch.arange(P, T, device=ids.device)
     span_rope = _rope(model, positions, dtype)
     x = (surface.row.to(dtype) * scale).expand(B, k, -1)
@@ -744,9 +834,17 @@ def answer_logits_from(model, surface: Surface, hiddens: Tensor) -> Tensor:
 class ThinkAdapter:
     """tasks.evaluate-compatible answer_logits for the think-scope arm."""
 
-    def __init__(self, model, surface: Surface, source: int, dest: int):
+    def __init__(
+        self,
+        model,
+        surface: Surface,
+        source: int,
+        dest: int,
+        prompt_cache: PromptStateCache | None = None,
+    ):
         self.model, self.surface = model, surface
         self.source, self.dest = source, dest
+        self.prompt_cache = prompt_cache or PromptStateCache(model)
 
     @torch.no_grad()
     def answer_hiddens(self, ids: Tensor, ks: list[int]) -> Tensor:
@@ -754,8 +852,16 @@ class ThinkAdapter:
         start = int(span[0, 0]) if len(span) else ids.shape[1]
         if start == ids.shape[1]:
             raise ValueError("think-scope eval needs a dot span")
+        prompt_state = self.prompt_cache.get(ids, start)
         h = think_outputs(
-            self.model, self.surface, ids, start, self.source, self.dest, ckpt=False
+            self.model,
+            self.surface,
+            ids,
+            start,
+            self.source,
+            self.dest,
+            ckpt=False,
+            prompt_state=prompt_state,
         )
         positions = torch.tensor(ks, device=ids.device, dtype=torch.long)
         return h.index_select(1, positions)
@@ -776,8 +882,14 @@ class ThinkAdapter:
 class DotsAdapter:
     """The matched no-wire span runner with the identical BF16 readout."""
 
-    def __init__(self, model, surface: Surface):
+    def __init__(
+        self,
+        model,
+        surface: Surface,
+        prompt_cache: PromptStateCache | None = None,
+    ):
         self.model, self.surface = model, surface
+        self.prompt_cache = prompt_cache or PromptStateCache(model)
 
     @torch.no_grad()
     def answer_hiddens(self, ids: Tensor, ks: list[int]) -> Tensor:
@@ -785,7 +897,15 @@ class DotsAdapter:
         start = int(span[0, 0]) if len(span) else ids.shape[1]
         if start == ids.shape[1]:
             raise ValueError("dots eval needs a dot span")
-        h = parallel_outputs(self.model, self.surface, ids, start, ckpt=False)
+        prompt_state = self.prompt_cache.get(ids, start)
+        h = parallel_outputs(
+            self.model,
+            self.surface,
+            ids,
+            start,
+            ckpt=False,
+            prompt_state=prompt_state,
+        )
         positions = torch.tensor(ks, device=ids.device, dtype=torch.long)
         return h.index_select(1, positions)
 
@@ -962,6 +1082,10 @@ def _execution_plan(
     if k <= 8:
         microbatch = _largest_divisor_at_most(batch, max(1, 2048 // k))
         return ExecutionPlan(microbatch, frozenset())
+    if batch == 512 and k == 16 and n_layers == 26:
+        # Four evenly spaced recurrent layers fit at 18.00 GiB and avoid
+        # their 15 repeated recomputations (1.9% measured throughput gain).
+        return ExecutionPlan(batch, layers - {7, 13, 19, 25})
     return ExecutionPlan(batch, layers)
 
 
@@ -1040,18 +1164,34 @@ def gate_mode(args) -> None:
     raise SystemExit(0 if ok else 1)
 
 
-def evaluate_sweep(model, surface, tok, task, k_set, n, condition, source, dest, batch):
+def evaluate_sweep(
+    model,
+    surface,
+    tok,
+    task,
+    k_set,
+    n,
+    condition,
+    source,
+    dest,
+    batch,
+    *,
+    runner=None,
+    rows=None,
+):
     surface.sync_into(model)
-    runner = (
-        ThinkAdapter(model, surface, source, dest)
-        if condition == "dots+wire"
-        else DotsAdapter(model, surface)
-    )
-    instances = tasks.sample(tasks.TASKS[task], n, 0, **tasks.KNOBS[task])
-    rows = {
-        k: [tasks.encode(tok, instance, "dots", k) for instance in instances]
-        for k in k_set
-    }
+    if runner is None:
+        runner = (
+            ThinkAdapter(model, surface, source, dest)
+            if condition == "dots+wire"
+            else DotsAdapter(model, surface)
+        )
+    if rows is None:
+        instances = tasks.sample(tasks.TASKS[task], n, 0, **tasks.KNOBS[task])
+        rows = {
+            k: [tasks.encode(tok, instance, "dots", k) for instance in instances]
+            for k in k_set
+        }
     results = tasks.evaluate_dot_sweep(model, rows, runner, min(batch, n))
     return {k: (result["acc"], result["legal"]) for k, result in results.items()}
 
@@ -1218,6 +1358,26 @@ def run_mode(args) -> None:
     )
     task_list = args.tasks.split(",")
     k_set = [int(s) for s in args.k.split(",")]
+    eval_runner = None
+    eval_rows = {}
+    if args.eval_every:
+        prompt_cache = PromptStateCache(model)
+        eval_runner = (
+            ThinkAdapter(model, surface, args.source, args.dest, prompt_cache)
+            if args.condition == "dots+wire"
+            else DotsAdapter(model, surface, prompt_cache)
+        )
+        for task_name in task_list:
+            instances = tasks.sample(
+                tasks.TASKS[task_name],
+                args.eval_n,
+                0,
+                **tasks.KNOBS[task_name],
+            )
+            eval_rows[task_name] = {
+                k: [tasks.encode(tok, instance, "dots", k) for instance in instances]
+                for k in k_set
+            }
     start_step = 1
     if args.resume is not None:
         resume_path = args.out if args.resume == "auto" else args.resume
@@ -1274,6 +1434,8 @@ def run_mode(args) -> None:
                     args.source,
                     args.dest,
                     args.batch,
+                    runner=eval_runner,
+                    rows=eval_rows[task_name],
                 )
         torch.cuda.synchronize()
         compiled_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
@@ -1342,6 +1504,8 @@ def run_mode(args) -> None:
                         args.source,
                         args.dest,
                         args.batch,
+                        runner=eval_runner,
+                        rows=eval_rows[task_name],
                     )
                     row = "  ".join(
                         f"k{k}:{accuracy:.3f}/{legal:.2f}"

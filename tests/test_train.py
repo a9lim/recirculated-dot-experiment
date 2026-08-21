@@ -29,7 +29,10 @@ def test_execution_plan_keeps_effective_batch_and_compiled_shapes():
     assert _execution_plan("auto", 512, 8, 26).microbatch == 256
     assert _execution_plan("auto", 512, 16, 26).microbatch == 512
     assert not _execution_plan("auto", 512, 8, 26).checkpoint_layers
-    assert len(_execution_plan("auto", 512, 16, 26).checkpoint_layers) == 26
+    assert _execution_plan("auto", 512, 16, 26).checkpoint_layers == (
+        frozenset(range(26)) - {7, 13, 19, 25}
+    )
+    assert len(_execution_plan("auto", 512, 32, 26).checkpoint_layers) == 26
     assert _execution_plan("auto", 510, 8, 26).microbatch == 255
 
 
