@@ -572,7 +572,12 @@ def _span_parallel(model, packed, x, span_rope, prompt_kv, lo, hi, ckpt):
             True,
         )
         if _checkpoint_layer(ckpt, i):
-            x, _, _ = checkpoint(_single_layer_c, *args, use_reentrant=False)
+            x, _, _ = checkpoint(
+                _single_layer_c,
+                *args,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
         else:
             x, _, _ = _single_layer_c(*args)
     return x
@@ -591,7 +596,12 @@ def _slab_first(model, packed, x, pe_sl, rope, shared, lo, hi, source, ckpt):
             False,
         )
         if _checkpoint_layer(ckpt, i):
-            x, k, v = checkpoint(_single_layer_c, *args, use_reentrant=False)
+            x, k, v = checkpoint(
+                _single_layer_c,
+                *args,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
         else:
             x, k, v = _single_layer_c(*args)
         new_kv.append((k, v))
@@ -634,7 +644,12 @@ def _slab_pair(
             *shared[i][1],
         )
         if _checkpoint_layer(ckpt, i):
-            out = checkpoint(_dual_layer_from_pieces, *args, use_reentrant=False)
+            out = checkpoint(
+                _dual_layer_from_pieces,
+                *args,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
         else:
             out = _dual_layer_from_pieces(*args)
         refresh, first, kr, vr, kf, vf = out
@@ -1439,20 +1454,23 @@ def run_mode(args) -> None:
             )[0]
         if args.eval_every:
             for task_name in task_list:
-                evaluate_sweep(
-                    model,
-                    surface,
-                    tok,
-                    task_name,
-                    k_set,
-                    args.eval_n,
-                    args.condition,
-                    args.source,
-                    args.dest,
-                    args.batch,
-                    runner=eval_runner,
-                    rows=eval_rows[task_name],
-                )
+                # Miss once to fill the pinned-host cache, then hit once to
+                # compile its packed-view stride/layout. Both are untimed.
+                for _ in range(2):
+                    evaluate_sweep(
+                        model,
+                        surface,
+                        tok,
+                        task_name,
+                        k_set,
+                        args.eval_n,
+                        args.condition,
+                        args.source,
+                        args.dest,
+                        args.batch,
+                        runner=eval_runner,
+                        rows=eval_rows[task_name],
+                    )
         torch.cuda.synchronize()
         compiled_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
         print(
