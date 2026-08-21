@@ -47,6 +47,7 @@ Run: python -m recirculated_dot_experiment.train gate|run [flags]
 from __future__ import annotations
 
 import argparse
+import gc
 import math
 import random
 import time
@@ -999,6 +1000,8 @@ def run_mode(args) -> None:
         torch.cuda.synchronize()
         print(f"compile/warmup {time.perf_counter() - compile_start:.1f}s (not timed)")
         del warm_loss, ids, answers, ids_cpu, answers_cpu
+        gc.collect()
+        torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         t0 = time.perf_counter()
 
@@ -1064,7 +1067,7 @@ def main() -> None:
     p.add_argument("--condition", choices=["dots+wire", "dots"], default="dots+wire")
     p.add_argument("--tasks", default="parity")
     p.add_argument("--k", default="1,2,4,8,16,32")
-    p.add_argument("--batch", type=int, default=512)
+    p.add_argument("--batch", type=int, default=256)
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--lam", type=float, default=1.0)
