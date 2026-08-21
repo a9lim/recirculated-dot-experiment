@@ -187,8 +187,12 @@ region, forcing wire utilization and keeping the credit chain short.
 Full scope follows in a later phase (the wire-alone 2×2 cell is
 inherently full-scope and joins then; in full scope, where the gate
 concentrates α is an interp readout in its own right). k is sampled
-per step from the eval sweep set, homogeneous within a batch; task
-sampled per step likewise (mixture is the goal, per-task the
+per step from the training k set (D15: `--train-k`, default drops
+k=1 — no serial computation is possible there, so it stays an
+eval-only structural probe — weighted `P(k) ∝ k^γ`, default γ=1;
+the fat tail pushes the learned halting hazard toward the large-k
+regime where wire competence lives), homogeneous within a batch;
+task sampled per step likewise (mixture is the goal, per-task the
 benchmark). Sampling is online and fresh, train seeds disjoint from
 the eval seed, addressable by `(seed, step)` for exact resume.
 
@@ -214,11 +218,16 @@ teaches a stopping *hazard*, activating D4's halting-by-sampling in
 v0. Interior prompt positions stay unsupervised. Full-vocab CE via
 one-shape compiled 512-row slabs with a live tied `<t>` column.
 
-**Optimization (D6).** AdamW, weight decay 0, lr 1e-3, linear warmup
-(default 100 steps) then flat — no global decay, so later curriculum
-stages (if H2 needs them) each reset their own schedule; the prior
-experiment's hard-won lesson is that a single decaying schedule
-across stage transitions falls apart. Checkpoints are atomic and
+**Optimization (D6, D15).** AdamW, weight decay 0, peak lr 1e-3:
+linear warmup (default 100 steps), one cosine period down to
+`--lr-floor` (default 1e-4), then flat at the floor. The period
+(`--cosine`, default 2000 steps; 0 = flat at peak) is deliberately
+independent of `--steps` — a run may end mid-cosine or coast on the
+floor — and the lr is a pure function of the within-run step, so
+resume is exact with no schedule state. The prior experiment's
+hard-won lesson stands as *stage* discipline: a single schedule must
+never span a curriculum stage transition; each stage is its own run
+with its own warmup+cosine. Checkpoints are atomic and
 RNG/optimizer-complete, resumable by step (`--resume`), default
 `data/train/surface.pt`.
 
@@ -283,8 +292,9 @@ alternatives, and the paths not taken are in the journal.
   chooses dot-vs-answer natively; v0 trains fixed sampled k.
 - **D5** Wire scope is a config axis: think (v0) vs full (later);
   full-scope α migration is an interp readout.
-- **D6** Fat batches, BPTT serial over positions; flat LR after
-  warmup; any curriculum stage resets its schedule.
+- **D6** Fat batches, BPTT serial over positions; any curriculum
+  stage resets its schedule (the predecessor's lesson was about
+  cross-stage resets, not the within-stage shape — see D15).
 - **D7** Model = Gemma3-1B PT, pair {11,4} 0-indexed, α=0.15 ramped
   over 10 positions untrained.
 - **D8** `<t>` := `<unused0>` (single token, tied row, no resize);
@@ -306,6 +316,10 @@ alternatives, and the paths not taken are in the journal.
   (content-free dots make the rollout prefix deterministic): greedy
   halt plus the closed-form sampled-halting marginal; non-halt within
   budget is a recorded outcome; dot arms only, CoT stays forced.
+- **D15** Within-stage LR is cosine to a floor with a period
+  independent of the run length (flat tail past the period; stages
+  reset by being separate runs); training k is fat-tailed
+  `P(k) ∝ k^γ` over `--train-k` with k=1 eval-only.
 
 ## Open
 

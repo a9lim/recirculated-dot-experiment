@@ -1234,14 +1234,36 @@ def evaluate_sweep(
     return {k: (result["acc"], result["legal"]) for k, result in results.items()}
 
 
-def _step_choice(seed: int, step: int, task_list: list[str], k_set: list[int]):
+def _lr_at(step: int, args) -> float:
+    """Learning rate as a pure function of the within-run step (D15).
+
+    Linear warmup to the peak, one cosine period down to the floor, then
+    flat at the floor. The period is independent of --steps: a run may
+    end mid-cosine or coast on the floor, and curriculum stages reset
+    schedules by being separate runs (D6). --cosine 0 is the flat recipe.
+    """
+    if step < args.warmup:
+        return args.lr * step / max(args.warmup, 1)
+    if not args.cosine:
+        return args.lr
+    t = min((step - args.warmup) / args.cosine, 1.0)
+    return args.lr_floor + (args.lr - args.lr_floor) * 0.5 * (1 + math.cos(math.pi * t))
+
+
+def _step_choice(
+    seed: int,
+    step: int,
+    task_list: list[str],
+    k_set: list[int],
+    k_weights: list[float] | None = None,
+):
     """A random-looking schedule addressable by step for exact resume."""
     rng = random.Random((seed << 32) ^ step)
-    return rng.choice(task_list), rng.choice(k_set)
+    return rng.choice(task_list), rng.choices(k_set, weights=k_weights)[0]
 
 
-def _make_cpu_batch(tok, args, task_list, k_set, step: int):
-    task, k = _step_choice(args.seed, step, task_list, k_set)
+def _make_cpu_batch(tok, args, task_list, k_set, step: int, k_weights=None):
+    task, k = _step_choice(args.seed, step, task_list, k_set, k_weights)
     sample_seed = 1_000_000 + args.seed * 10_000_000 + step
     instances = tasks.sample(
         tasks.TASKS[task], args.batch, sample_seed, **tasks.KNOBS[task]
@@ -1255,9 +1277,10 @@ def _make_cpu_batch(tok, args, task_list, k_set, step: int):
 class _BatchProducer:
     """Bounded one-worker tokenizer/generator pipeline."""
 
-    def __init__(self, tok, args, task_list, k_set, start: int):
+    def __init__(self, tok, args, task_list, k_set, start: int, k_weights=None):
         self.tok, self.args = tok, args
         self.task_list, self.k_set = task_list, k_set
+        self.k_weights = k_weights
         self.depth = max(args.prefetch, 1)
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dot-batches")
         self.futures: dict[int, Future] = {}
@@ -1273,6 +1296,7 @@ class _BatchProducer:
                 self.task_list,
                 self.k_set,
                 step,
+                self.k_weights,
             )
 
     def get(self, step: int):
@@ -1396,6 +1420,8 @@ def run_mode(args) -> None:
     opt = torch.optim.AdamW(surface.parameters(), lr=args.lr, weight_decay=0.0)
     task_list = args.tasks.split(",")
     k_set = [int(s) for s in args.k.split(",")]
+    train_k = [int(s) for s in args.train_k.split(",")]
+    k_weights = [k**args.k_gamma for k in train_k]
     eval_runner = None
     eval_rows = {}
     if args.eval_every:
@@ -1418,21 +1444,26 @@ def run_mode(args) -> None:
         resume_path = args.out if args.resume == "auto" else args.resume
         start_step = _load_checkpoint(resume_path, surface, opt) + 1
         print(f"resumed {resume_path} at step {start_step - 1}")
-    print(f"condition {args.condition}, tasks {task_list}, k {k_set}, B {args.batch}")
+    print(
+        f"condition {args.condition}, tasks {task_list}, eval k {k_set}, "
+        f"train k {train_k} (P~k^{args.k_gamma:g}), B {args.batch}, "
+        f"lr {args.lr:g} cosine {args.cosine} floor {args.lr_floor:g}"
+    )
 
-    producer = _BatchProducer(tok, args, task_list, k_set, start_step)
+    producer = _BatchProducer(tok, args, task_list, train_k, start_step, k_weights)
     completed_step = start_step - 1
     try:
-        # Warm every configured k before the experiment clock: each k is
+        # Warm every training k before the experiment clock: each k is
         # shape-distinct somewhere (span length, the execution plan's
         # microbatch, the dynamic=False head-CE chunk — a [max,1,2,4]
         # heuristic let k=8's B=256 chunk escape into a timed step), plus
-        # every prompt family. Largest k first (cache-backing canon). No
+        # every prompt family. Eval-only ks (e.g. k=1) warm through the
+        # eval sweep below. Largest k first (cache-backing canon). No
         # optimizer update occurs; the timed loop rejects escaped compiles.
         warm_args = argparse.Namespace(**vars(args))
         warm_args.seed = args.seed + 97_531
         warm_args.batch = args.batch
-        structural = sorted(set(k_set), reverse=True)
+        structural = sorted(set(train_k), reverse=True)
         warm_cases = [(task_list[0], k) for k in structural]
         warm_cases.extend((task, structural[-1]) for task in task_list)
         warm_cases = list(dict.fromkeys(warm_cases))
@@ -1514,8 +1545,9 @@ def run_mode(args) -> None:
                 parameter.grad is not None for parameter in model.parameters()
             ):
                 raise RuntimeError("frozen base model accumulated a gradient")
-            for group in opt.param_groups:  # linear warmup, then flat (D6)
-                group["lr"] = args.lr * min(step / max(args.warmup, 1), 1.0)
+            lr_now = _lr_at(step, args)
+            for group in opt.param_groups:
+                group["lr"] = lr_now
             opt.step()
             completed_step = step
             if step % args.log_every == 0:
@@ -1580,7 +1612,18 @@ def main() -> None:
     p.add_argument("--dest", type=int, default=4)
     p.add_argument("--condition", choices=["dots+wire", "dots"], default="dots+wire")
     p.add_argument("--tasks", default="parity")
-    p.add_argument("--k", default="1,2,4,8,16,32")
+    p.add_argument("--k", default="1,2,4,8,16,32", help="eval sweep k set")
+    p.add_argument(
+        "--train-k",
+        default="2,4,8,16,32",
+        help="training k set; k=1 is eval-only by default (D15)",
+    )
+    p.add_argument(
+        "--k-gamma",
+        type=float,
+        default=1.0,
+        help="training k weight exponent, P(k) ~ k**gamma; 0 = uniform",
+    )
     p.add_argument(
         "--batch",
         type=int,
@@ -1589,6 +1632,14 @@ def main() -> None:
     )
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument(
+        "--cosine",
+        type=int,
+        default=2000,
+        help="cosine period in steps after warmup, then flat at the floor; "
+        "independent of --steps; 0 = flat at --lr (D15)",
+    )
+    p.add_argument("--lr-floor", type=float, default=1e-4)
     p.add_argument("--lam", type=float, default=1.0)
     p.add_argument("--checkpoint", choices=["auto", "always", "never"], default="auto")
     p.add_argument("--warmup", type=int, default=100)
