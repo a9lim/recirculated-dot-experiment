@@ -269,3 +269,46 @@ the history and takes future entries as they happen; AGENTS.md and
 README.md properly populated. Handoff gates re-run on jobe at
 e80af1c before the restructure was committed — see findings for the
 witnessed numbers.
+
+## 2026-08-21 — H2 launch: two warmup crashes, then D14
+
+First real-run launch (parity dots+wire + dots control, sequential,
+detached with a DONE marker) died twice in warmup, both times caught
+in minutes because the launch was probed rather than trusted:
+
+1. **Recompile guard, round two.** `_dual_layer_math` blew Dynamo's
+   default 8-per-frame limit at k=32 — span-view strides, rope
+   slices, and prefix lengths all carry k, so the dual layer
+   legitimately compiles a shape family per k. The hindsight pass
+   had retired the global `recompile_limit=256` after validating the
+   task grid and a k=8 train smoke under the default guard; the
+   full-k training warmup was the unexercised hole. Fix: raise the
+   limit at **CLI scope** in train/tasks mains (imports still never
+   touch global Dynamo config); the accidental-recompile guard
+   remains the in-step unique-graph audit.
+2. **Warm-set heuristic hole.** With the guard raised, warmup
+   completed (36 graphs) but the audit tripped at the first sampled
+   k=8 step: the structural warm set [max,1,2,4] never ran k=8's
+   execution plan, whose B=256 microbatch gives the dynamic=False
+   head-CE chunk a new [256,2] shape. Fix: warm **every** configured
+   k, largest first — each k is shape-distinct somewhere, and
+   compile is setup by canon.
+
+Lesson recorded: an audit that fires is doing its job — both crashes
+were the zero-compile-in-step contract catching real coverage holes,
+not noise. Probe a launch with `--steps 4` before detaching it.
+
+**D14 landed** (a9 ratified): free-running evaluation as a *derived*
+readout on the max-k sweep. Content-free identical dots make a free
+rollout's prefix equal the teacher-forced one, so halting needs no
+generation loop: greedy (first non-`<t>` argmax; non-halt within
+budget scores as wrong and is reported) plus the exact closed-form
+sampled-halting marginal — P(halt at t) = (1−p_t(dot))·∏p_s(dot),
+gold/legal emission masses, expected halt time — all from one run's
+per-position logits, no Monte Carlo. Verified against a 200k-rollout
+Monte Carlo simulation in the tests. This finally *measures* what
+D4/D12 train (the stopping hazard), and instance-conditional halting
+correlated with serial difficulty becomes a second wire-vs-no-wire
+discriminator. The forced k-sweep stays the training monitor; the
+running H2 jobs predate the readout, so their checkpoints get scored
+post hoc.

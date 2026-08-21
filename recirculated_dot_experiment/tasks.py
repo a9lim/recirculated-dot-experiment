@@ -30,6 +30,12 @@ once and read every causal prefix through matched BF16 heads; full-
 and think-scope wire runners are named separately. Final partial
 batches are duplicate-row padded and discarded before scoring.
 
+Free running (D14) is a readout derived from the same max-k rows:
+content-free identical dots make a free rollout's prefix equal the
+teacher-forced one, so greedy halting (first non-`<t>` argmax) and
+the exact sampled-halting marginal come from per-position logits with
+no generation loop. Non-halt within budget is reported, never hidden.
+
 Importable on the Mac: the wire's flash-attn hard import is reached
 only from the CLI, which is jobe-only like everything model-facing.
 
@@ -422,6 +428,16 @@ def main() -> None:
                         f"legal {result['legal']:.3f}  "
                         f"gold_lp {result['gold_lp']:7.3f}"
                     )
+                free = evaluate_free_running(
+                    model, rows_by_k[max(ks)], runner, args.batch
+                )
+                print(
+                    f"  {cond + ' free':17s}        "
+                    f"halt {free['halt']:.3f} acc {free['acc']:.3f} "
+                    f"legal {free['legal']:.3f} k~{free['k_halt']:4.1f}  |  "
+                    f"soft halt {free['p_halt']:.3f} gold {free['p_gold']:.3f} "
+                    f"k~{free['k_soft']:4.1f}"
+                )
                 continue
 
             budgets = ks if think == "cot" else [0]
