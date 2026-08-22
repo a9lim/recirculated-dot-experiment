@@ -391,3 +391,9 @@ sweep as the structural-invariance probe. Deliberately *not* taken
 now: λ-per-k. Note: the (task,k) schedule stream changed, so
 resuming pre-D15 checkpoints under new defaults would silently alter
 their schedule — fresh runs only across this boundary.
+
+Addendum, same session: a9 asked whether k=2 should go too. It
+should, and for a structural reason rather than a hunch — refreshed
+columns reach a readout only from t=3, so at k≤2 no supervised logit
+sees the wire and the step trains the row alone. Default `--train-k`
+is {4,8,16,32}; k≤2 remain in the eval sweep as the invariance probe.

@@ -187,11 +187,13 @@ region, forcing wire utilization and keeping the credit chain short.
 Full scope follows in a later phase (the wire-alone 2×2 cell is
 inherently full-scope and joins then; in full scope, where the gate
 concentrates α is an interp readout in its own right). k is sampled
-per step from the training k set (D15: `--train-k`, default drops
-k=1 — no serial computation is possible there, so it stays an
-eval-only structural probe — weighted `P(k) ∝ k^γ`, default γ=1;
-the fat tail pushes the learned halting hazard toward the large-k
-regime where wire competence lives), homogeneous within a batch;
+per step from the training k set (D15: `--train-k`, default
+{4,8,16,32} — at k≤2 refreshed columns reach no supervised logit
+(the same-snapshot rule: a readout sees refreshed state only from
+t=3), so those steps would train the row alone; k≤2 stay eval-only
+structural probes — weighted `P(k) ∝ k^γ`, default γ=1; the fat tail
+pushes the learned halting hazard toward the large-k regime where
+wire competence lives), homogeneous within a batch;
 task sampled per step likewise (mixture is the goal, per-task the
 benchmark). Sampling is online and fresh, train seeds disjoint from
 the eval seed, addressable by `(seed, step)` for exact resume.
@@ -319,7 +321,8 @@ alternatives, and the paths not taken are in the journal.
 - **D15** Within-stage LR is cosine to a floor with a period
   independent of the run length (flat tail past the period; stages
   reset by being separate runs); training k is fat-tailed
-  `P(k) ∝ k^γ` over `--train-k` with k=1 eval-only.
+  `P(k) ∝ k^γ` over `--train-k`, k≤2 eval-only (no readout sees the
+  wire before t=3).
 
 ## Open
 

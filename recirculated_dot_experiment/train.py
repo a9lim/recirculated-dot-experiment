@@ -1615,8 +1615,10 @@ def main() -> None:
     p.add_argument("--k", default="1,2,4,8,16,32", help="eval sweep k set")
     p.add_argument(
         "--train-k",
-        default="2,4,8,16,32",
-        help="training k set; k=1 is eval-only by default (D15)",
+        default="4,8,16,32",
+        help="training k set; k<=2 is eval-only by default (D15): refreshed "
+        "columns reach no supervised logit before t=3, so those steps train "
+        "the row alone",
     )
     p.add_argument(
         "--k-gamma",
