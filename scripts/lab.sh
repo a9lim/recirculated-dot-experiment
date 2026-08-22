@@ -95,9 +95,10 @@ case $cmd in
   status)
     [[ -f $STATUS ]] && tail -n 8 "$STATUS" || echo "no queue marker yet"
     running && echo "-- training active --" || echo "-- no training active --"
-    for f in $(ls -t logs/*.log 2>/dev/null | head -2); do
-      echo "== $f"; grep -E "^step|eval" "$f" | tail -3
-    done ;;
+    for f in $(ls -t logs/*.log 2>/dev/null | grep -vE 'score|probe|queue' | head -2); do
+      echo "== $f"; grep -E "^step|eval" "$f" | tail -3 || true
+    done
+    exit 0 ;;
   watch)
     tail -n 0 -F logs/queue.log "$STATUS" 2>/dev/null | grep --line-buffered -E "$FILTER" ;;
   kill)
