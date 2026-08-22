@@ -397,3 +397,38 @@ should, and for a structural reason rather than a hunch — refreshed
 columns reach a readout only from t=3, so at k≤2 no supervised logit
 sees the wire and the step trains the row alone. Default `--train-k`
 is {4,8,16,32}; k≤2 remain in the eval sweep as the invariance probe.
+
+## 2026-08-21 — λ, and the lab gets a front door
+
+λ discussion with a9, from the parity4 logs: the emission term is the
+fast easy loss (collapses to its hazard-entropy floor within ~400
+steps) and its residual gradient *oscillates by construction* —
+homogeneous-k batches alternately push "dot" and "answer" at the same
+position, and the tied row absorbs that every step, scaled by λ.
+Plausibly a contributor to the bistable small-k legality. The task
+plateau itself read as the gate's routing search from a symmetric
+answer distribution, not as emission crowding out task gradient, so
+λ is second-order to D15's schedule/k changes. Options weighed: lower
+constant (cheap, mechanistically clean), anneal high→low (mostly
+what cosine already buys), reverse-anneal low→high ("learn to think,
+then learn to stop" — elegant, but interference risk through the
+tied row and unreadable as an ablation). a9's call: **λ=0.125
+constant by default**. Gradient gate re-witnessed under it (loss
+12.875, grad 2.698e-2 — numbers move with λ, thresholds hold).
+
+Also raised, not yet acted on: at length 4 B=512 presents 16
+instances ~32× per step — full-batch GD — so B=128 would give ~2–2.5×
+more optimizer steps per GPU-hour at the same gradient; a len-4
+efficiency, not a recipe change, and it evaporates by len 16.
+
+a9 wants to drive runs herself to save session budget, roping the
+seat in when something interesting shows up. Hence `scripts/`
+(operator tooling, outside the three-module package): `lab.sh`
+(gate, probe, probed detached runs and queues with logs/queue.log +
+queue-STATUS/DONE, score, status, watch, kill — including the
+pkill-by-pattern and stdin-inheritance lessons from today) and
+`score.py` (the post-hoc pass generalized, driven by each
+checkpoint's saved args: nulls per knob set, home + cross-arm cells,
+snapshot trajectories, `--transfer` knob sweeps). The planned parity4
+D15 pair sits in `scripts/example-queue.txt`. Smoke-tested end to
+end on jobe before handing over.

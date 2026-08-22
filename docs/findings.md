@@ -72,18 +72,19 @@ by each training job's step-0-equivalent eval.
 
 ## Training path correctness (gradient gate)
 
-**PASS** (re-witnessed 2026-08-21 at `e80af1c`, B=2, parity len 4,
-k=3): functional loss 29.500000 = rerun (bitwise-deterministic at
-this shape) = reference at bf16 print resolution; grad max-rel vs the
-independent reference 2.271e-2 zero-init and 5.176e-2 with the
-perturbed gate (the second state activates the hidden MLP layers that
-zero-init blocks); span drive vs the plain HF forward mean |Δlogit|
-9.42e-2, top-1 1.0000. All inside the pinned thresholds (design.md:
+**PASS** (re-witnessed 2026-08-21 at `3572c0a` under D15's λ=0.125,
+B=2, parity len 4, k=3): functional loss 12.875000 = rerun
+(bitwise-deterministic at this shape) = reference at bf16 print
+resolution; grad max-rel vs the independent reference 2.698e-2
+zero-init (2.271e-2 at λ=1) and 5.176e-2 with the perturbed gate (the
+second state activates the hidden MLP layers that zero-init blocks);
+span drive vs the plain HF forward mean |Δlogit| 9.42e-2, top-1
+1.0000. All inside the pinned thresholds (design.md:
 Gates), which sit in the gap between measured kernel noise and the
 O(0.5+) scale a deliberately broken visibility set produces. The
 max-k sweep readout agrees with standalone execution at 100%
 full-vocab top-1, mean |Δlogit| 0.047–0.056 (the established tiling
-null). All 10 project tests pass on jobe; the Mac runs the 4
+null). All 15 project tests pass on jobe; the Mac runs the 7
 model-free ones and skips the rest.
 
 ## Training path throughput
