@@ -90,7 +90,8 @@ model-free ones and skips the rest.
 ## Training path throughput
 
 One optimizer step, parity, forward + full-vocab emission-span loss +
-backward + AdamW, effective B=512 under `checkpoint=auto`:
+backward + AdamW, effective B=512 under the internal automatic
+activation-checkpoint policy:
 
 | k | plan | step | throughput | peak |
 |---|---|---|---|---|

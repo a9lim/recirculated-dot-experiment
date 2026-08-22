@@ -432,3 +432,13 @@ checkpoint's saved args: nulls per knob set, home + cross-arm cells,
 snapshot trajectories, `--transfer` knob sweeps). The planned parity4
 D15 pair sits in `scripts/example-queue.txt`. Smoke-tested end to
 end on jobe before handing over.
+
+## 2026-08-21 — activation checkpointing is not a run axis
+
+a9 caught that `--checkpoint {auto,always,never}` exposed an execution
+detail as though it were an experimental knob. Removed the flag and the
+alternate policy argument beneath it: `_execution_plan` now directly applies
+the measured D13 automatic policy, so every warmup and training step uses the
+same B*k/microbatch/layer knees. The checkpoint *saving* flags are unchanged;
+this is only activation recomputation. Operator and current-state docs now
+describe the planner as internal.

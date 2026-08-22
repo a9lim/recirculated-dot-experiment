@@ -96,10 +96,6 @@
 #                            unused when --cosine 0).
 #   --lam X                  Weight of mean emission-span CE in
 #                            CE(answer)+X*mean(CE(emission)) (default 0.125).
-#   --checkpoint POLICY      Activation-checkpoint policy: `always` recomputes
-#                            every recurrent layer, `never` retains all, and
-#                            `auto` uses the measured 4090 B*k/microbatch/layer
-#                            knees (default auto). This is unrelated to saving.
 #   --seed N                 Training RNG seed (default 0): controls initialization,
 #                            task/k choice, and addressable online examples; the
 #                            checkpoint also preserves Python/Torch/CUDA RNG state.

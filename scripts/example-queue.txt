@@ -1,7 +1,7 @@
 # scripts/lab.sh queue scripts/example-queue.txt
 # TAG <train args> [| <score args>]   — one run per line, in order.
-# parity length 4 under D15 (cosine across the whole run, train-k {4..32}
-# P~k, lam 0.125), both arms, snapshots every 500, then scored with a
-# length-transfer readout.
-parity4d15-wire --condition dots+wire --knobs length=4 --steps 8000 --cosine 8000 --snapshot-every 500 --eval-n 512 | --transfer length=5,6,8
-parity4d15-dots --condition dots      --knobs length=4 --steps 8000 --cosine 8000 --snapshot-every 500 --eval-n 512 | --transfer length=5,6,8
+# Parity length 16 under D15: cosine for 8000 steps then 2000 at the floor,
+# train-k {4..32} with P~k, lam 0.125, snapshots every 500, and a length-
+# transfer readout. The wire arm is active; the dots control is parked below.
+parity16-wire --condition dots+wire --knobs length=16 --steps 10000 --cosine 8000 --snapshot-every 500 --eval-n 512 | --transfer length=8,12,16
+# parity16-dots --condition dots      --knobs length=16 --steps 10000 --cosine 8000 --snapshot-every 500 --eval-n 512 | --transfer length=8,12,16

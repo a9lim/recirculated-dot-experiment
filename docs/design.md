@@ -234,7 +234,8 @@ RNG/optimizer-complete, resumable by step (`--resume`), default
 `data/train/surface.pt`.
 
 **Execution policy (D13).** `--batch` is the effective optimizer
-batch (default 512). `checkpoint=auto` from measured 4090 knees:
+batch (default 512). The internal activation-checkpoint planner is
+fixed to the policy established from measured 4090 knees:
 retain activations while B·k ≤ 2048 (splitting into equal-shape
 microbatches up to k=8), at B=512/k=16 retain four evenly spaced
 recurrent layers, at k=32 recompute everything. Batch production is a
@@ -311,7 +312,7 @@ alternatives, and the paths not taken are in the journal.
   emission-span supervision `CE(ans) + λ·mean(CE(emit))`, per-task
   benchmark then mixture; online sampling; bf16 surface.
 - **D13** Audited CUDA training: packed shared projections, regional
-  compile, FA2-varlen dual branch, `checkpoint=auto` knees, max-k
+  compile, FA2-varlen dual branch, internal checkpoint-planner knees, max-k
   sweep eval, warm-everything + zero-compile-in-step, atomic
   RNG-complete resume; whole-step CUDA graphs rejected.
 - **D14** Free-running eval is a derived readout on the max-k sweep

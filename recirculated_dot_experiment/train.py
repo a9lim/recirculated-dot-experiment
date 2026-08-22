@@ -1098,7 +1098,6 @@ def _largest_divisor_at_most(value: int, limit: int) -> int:
 
 
 def _execution_plan(
-    policy: str,
     batch: int,
     k: int,
     n_layers: int,
@@ -1112,12 +1111,6 @@ def _execution_plan(
     if batch < 1 or k < 1:
         raise ValueError(f"batch and k must be positive, got B={batch}, k={k}")
     layers = frozenset(range(n_layers))
-    if policy == "always":
-        return ExecutionPlan(batch, layers)
-    if policy == "never":
-        return ExecutionPlan(batch, frozenset())
-    if policy != "auto":
-        raise ValueError(f"unknown checkpoint policy {policy!r}")
     if batch * k <= 2048:
         return ExecutionPlan(batch, frozenset())
     if k <= 8:
@@ -1473,7 +1466,6 @@ def run_mode(args) -> None:
                 tok, warm_args, [warm_task], [warm_k], warm_index
             )
             warm_plan = _execution_plan(
-                args.checkpoint,
                 args.batch,
                 warm_k,
                 model.config.num_hidden_layers,
@@ -1522,9 +1514,7 @@ def run_mode(args) -> None:
         for step in range(start_step, args.steps + 1):
             task, k, ids_cpu, answers_cpu, span_start = producer.get(step)
             opt.zero_grad(set_to_none=True)
-            plan = _execution_plan(
-                args.checkpoint, args.batch, k, model.config.num_hidden_layers
-            )
+            plan = _execution_plan(args.batch, k, model.config.num_hidden_layers)
             loss, ce_ans, ce_emit = _run_microbatches(
                 model,
                 surface,
@@ -1650,7 +1640,6 @@ def main() -> None:
         "weight, and a small one damps the per-batch dot/answer pressure on "
         "the tied row",
     )
-    p.add_argument("--checkpoint", choices=["auto", "always", "never"], default="auto")
     p.add_argument("--warmup", type=int, default=100)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-every", type=int, default=20)
