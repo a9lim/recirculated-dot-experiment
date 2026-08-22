@@ -213,7 +213,7 @@ preservation off, so no prefix copy survives the forward.
 
 **Supervision (D12).** lm_head over the whole emission span: the last
 prompt position and every dot target `<t>`; the last dot targets the
-answer. Loss `CE(answer) + λ·mean(CE(emission))` (default λ=1) — the
+answer. Loss `CE(answer) + λ·mean(CE(emission))` (default λ=0.125, D15) — the
 task gradient is k-independent, the dot targets carry no task
 content (H2 stays clean), and with sampled k the emission term
 teaches a stopping *hazard*, activating D4's halting-by-sampling in
@@ -322,7 +322,9 @@ alternatives, and the paths not taken are in the journal.
   independent of the run length (flat tail past the period; stages
   reset by being separate runs); training k is fat-tailed
   `P(k) ∝ k^γ` over `--train-k`, k≤2 eval-only (no readout sees the
-  wire before t=3).
+  wire before t=3); λ=0.125 (the emission term floors at hazard
+  entropy at any weight; small λ damps the homogeneous-k batches'
+  alternating dot/answer pressure on the tied row).
 
 ## Open
 

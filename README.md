@@ -55,6 +55,7 @@ place to stand.
 | `recirculated_dot_experiment/tasks.py` | task serialization + forced-choice eval |
 | `recirculated_dot_experiment/train.py` | think-scope BPTT, gradient gate, training CLI |
 | `recirculated_dot_experiment/g0.py` | wire gates: identity + perplexity repro |
+| `scripts/lab.sh`, `scripts/score.py` | operator front door: gates, probed detached runs/queues, post-hoc scoring |
 | `docs/design.md` | authoritative design: architecture, recipe, decisions |
 | `docs/findings.md` | current results and interpretation |
 | `docs/journal.md` | chronological lab notebook |
@@ -63,9 +64,11 @@ place to stand.
 Task generators are shared with a sibling experiment via the parent
 repo ([transformer-experiments](https://github.com/a9lim/transformer-experiments)).
 
-**Status**: wire and training path built and gate-verified; untrained
-baselines recorded (accuracy at chance everywhere, legality 0 — the
-zero line); training runs are next.
+**Status**: wire and training path built and gate-verified; first
+learned signal at parity length 4 (wire-trained, wire-run beats the
+untrained forced-choice baseline; no length transfer yet — see
+findings); recipe D15 (cosine, fat-tailed k, λ=0.125) is the current
+training configuration.
 
 ## Running
 
@@ -81,7 +84,10 @@ python -m recirculated_dot_experiment.train gate      # BPTT gradient gate
 python -m recirculated_dot_experiment.train run       # train the surface (--resume to continue)
 ```
 
-`tasks.py` and the test suite import without a GPU.
+`tasks.py` and the test suite import without a GPU. Day-to-day
+operation goes through `scripts/lab.sh` (`gate`, `probe`, `train TAG
+…`, `queue FILE`, `score TAG…`, `status`, `watch`, `kill`); see its
+header and `scripts/example-queue.txt`.
 
 ## License
 

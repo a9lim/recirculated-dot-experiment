@@ -37,6 +37,12 @@ changing anything substantive.
   (identity, perplexity repro). Not a fourth module.
 - `tests/` — shape/policy/serialization contracts; model-facing tests
   skip without flash-attn.
+- `scripts/` — operator tooling, not modules: `lab.sh` (gates,
+  probed detached runs and run queues with a DONE marker, scoring,
+  status/watch/kill) and `score.py` (post-hoc scorer: untrained nulls,
+  home/cross-arm cells, snapshot trajectories, knob transfer — driven
+  by each checkpoint's own saved args). `example-queue.txt` is the
+  current planned run.
 
 Anti-cruft clause: exactly three modules (wire, tasks, train) until
 something concrete forces a fourth. Task instance generators live in
@@ -81,3 +87,8 @@ training run on an ungated tree.
   watchers have silently missed completions before.
 - Training checkpoints default to `data/train/surface.pt` (ignored);
   `--resume` is exact (RNG-complete, step-addressable schedule).
+- Runs go through `scripts/lab.sh train|queue`: every run is probed
+  (`--steps 4`) before it is trained, logs land in `logs/TAG.log`
+  (+ `logs/queue.log` for `watch`), the marker is `logs/queue-STATUS`,
+  and each finished run is scored to `logs/TAG.score.log`. `--cosine`
+  is a period, not the run length — pass it explicitly per run.

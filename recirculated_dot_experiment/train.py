@@ -1642,7 +1642,14 @@ def main() -> None:
         "independent of --steps; 0 = flat at --lr (D15)",
     )
     p.add_argument("--lr-floor", type=float, default=1e-4)
-    p.add_argument("--lam", type=float, default=1.0)
+    p.add_argument(
+        "--lam",
+        type=float,
+        default=0.125,
+        help="emission-span CE weight (D15): the hazard calibrates at any "
+        "weight, and a small one damps the per-batch dot/answer pressure on "
+        "the tied row",
+    )
     p.add_argument("--checkpoint", choices=["auto", "always", "never"], default="auto")
     p.add_argument("--warmup", type=int, default=100)
     p.add_argument("--seed", type=int, default=0)
