@@ -1,8 +1,15 @@
 """Training path: think-scope BPTT through the wire (design.md D12).
 
-Trainable surface (D2): the `<t>` embedding row (bf16, tied —
-it is both how a dot is read and the dot's output logit) plus the
-paper's alpha,beta gate MLP. Base frozen throughout.
+Trainable surface (D2): the `<t>` embedding row (tied — it is both
+how a dot is read and the dot's output logit) plus the paper's
+alpha,beta gate MLP. Base frozen throughout. Precision split: the
+frozen base computes in bf16; the surface, its optimizer state, the
+gate's arithmetic, the loss, and every readout are fp32 — bf16
+parameters silently drop AdamW updates below half an ulp (a 2.2
+bias never moves at lr 1e-3) and a bf16 sigmoid is exactly 1 from
+z >= 6.25, i.e. a dead gate (journal 2026-08-22). Casts happen where
+the surface meets the residual stream: the scaled row entering the
+span, and the mixed destination state leaving the gate.
 
 Think scope (D5, ratified think-first): the prompt is prefilled once,
 in parallel, frozen and detached — its per-layer KV is a constant.
@@ -26,11 +33,13 @@ Supervision (D12, a9's call): lm_head over the whole emission span —
 the last prompt position and every dot target `<t>`, the last dot
 targets the answer. With per-batch sampled k this teaches a stopping
 hazard, activating D4's halting-by-sampling. Loss is
-CE(answer) + lambda*mean(CE(emission)) so the task gradient is
-k-independent; dot targets carry no task content, so credit for the
-computation still flows only through the answer (H2 stays clean).
-The head flattens each BF16 chunk to a 2-D GEMM and compiles CE with
-one padded shape; logits for the `<t>` column are recomputed from the
+CE(answer) + lambda*sum(CE(emission)): every supervised position weighs
+the same (lambda=1 is the plain token-level LM loss), so the learned
+hazard equals the training k distribution; dot targets carry no task
+content, so credit for the computation still flows only through the
+answer (H2 stays clean). The head flattens each chunk to a 2-D bf16
+GEMM, upcasts the logits, and compiles the fp32 CE with one padded
+shape; logits for the `<t>` column are recomputed in fp32 from the
 live row (tied), everything else from the frozen head.
 
 Gradient gate (D9, mandatory before any run): the functional path vs
@@ -73,11 +82,20 @@ from transformers.models.gemma3.modeling_gemma3 import apply_rotary_pos_emb
 from . import tasks
 from .wire import pack_model_projections
 
+CHECKPOINT_VERSION = 2  # v2: fp32 surface, gate output scaled by 1/d
+
 
 class GateMLP(nn.Module):
     """Paper recipe (D2): LN on concat(source, dest), two hidden GELU
     layers at d_model, sigmoid vector output. Zero-init last layer with
-    logit biases so training starts exactly at alpha=0.1, beta=0.9."""
+    logit biases so training starts exactly at alpha=0.1, beta=0.9.
+
+    The pre-sigmoid output is ``bias + (W x) / d``. AdamW moves every
+    entry of the zero-init output layer by ~lr per step, so without the
+    1/fan_in multiplier a coherent gradient drifts the logits by
+    lr * sum|x| per step and saturates the sigmoid inside warmup — the
+    measured dead-gate failure (journal 2026-08-22). fp32 throughout;
+    the mix casts the result back to the residual's dtype."""
 
     def __init__(self, d: int, alpha0: float = 0.1, beta0: float = 0.9):
         super().__init__()
@@ -85,16 +103,49 @@ class GateMLP(nn.Module):
         self.h1 = nn.Linear(2 * d, d)
         self.h2 = nn.Linear(d, d)
         self.out = nn.Linear(d, 2 * d)
+        self.out_scale = 1.0 / d
         nn.init.zeros_(self.out.weight)
         with torch.no_grad():
             self.out.bias[:d] = math.log(alpha0 / (1 - alpha0))
             self.out.bias[d:] = math.log(beta0 / (1 - beta0))
 
     def forward(self, h_s: Tensor, h_d: Tensor) -> tuple[Tensor, Tensor]:
-        x = torch.cat([h_s, h_d], dim=-1)
-        x = self.out(F.gelu(self.h2(F.gelu(self.h1(self.norm(x))))))
-        alpha, beta = torch.sigmoid(x).chunk(2, dim=-1)
-        return alpha, beta
+        return _gate_math(
+            h_s,
+            h_d,
+            self.norm.weight,
+            self.norm.bias,
+            self.h1.weight,
+            self.h1.bias,
+            self.h2.weight,
+            self.h2.bias,
+            self.out.weight,
+            self.out.bias,
+            self.out_scale,
+        )
+
+
+def _gate_math(
+    h_s: Tensor,
+    h_d: Tensor,
+    norm_weight: Tensor,
+    norm_bias: Tensor,
+    h1_weight: Tensor,
+    h1_bias: Tensor,
+    h2_weight: Tensor,
+    h2_bias: Tensor,
+    out_weight: Tensor,
+    out_bias: Tensor,
+    out_scale: float,
+) -> tuple[Tensor, Tensor]:
+    """Tensor-only gate: fp32 (alpha, beta) from half-precision residuals."""
+    x = torch.cat((h_s, h_d), dim=-1).float()
+    x = F.layer_norm(x, (norm_weight.shape[0],), norm_weight, norm_bias)
+    x = F.gelu(F.linear(x, h1_weight, h1_bias))
+    x = F.gelu(F.linear(x, h2_weight, h2_bias))
+    z = F.linear(x, out_weight) * out_scale + out_bias
+    alpha, beta = torch.sigmoid(z).chunk(2, dim=-1)
+    return alpha, beta
 
 
 def _gate_mix_math(
@@ -109,17 +160,23 @@ def _gate_mix_math(
     h2_bias: Tensor,
     out_weight: Tensor,
     out_bias: Tensor,
+    out_scale: float,
 ) -> Tensor:
     """Tensor-only adaptive gate plus norm-matched residual mix."""
-    x = torch.cat((h_s, h_d), dim=-1)
-    x = F.layer_norm(x, (norm_weight.shape[0],), norm_weight, norm_bias)
-    x = F.gelu(F.linear(x, h1_weight, h1_bias))
-    x = F.gelu(F.linear(x, h2_weight, h2_bias))
-    alpha, beta = torch.sigmoid(F.linear(x, out_weight, out_bias)).chunk(2, dim=-1)
-    ratio = h_d.norm(dim=-1, keepdim=True) / h_s.norm(dim=-1, keepdim=True).clamp_min(
-        cfg_eps
+    alpha, beta = _gate_math(
+        h_s,
+        h_d,
+        norm_weight,
+        norm_bias,
+        h1_weight,
+        h1_bias,
+        h2_weight,
+        h2_bias,
+        out_weight,
+        out_bias,
+        out_scale,
     )
-    return beta * h_d + alpha * ratio * h_s
+    return _mix(cfg_eps, h_s, h_d, alpha, beta)
 
 
 def _gate_mix(gate: GateMLP, h_s: Tensor, h_d: Tensor, eps: float = 1e-6) -> Tensor:
@@ -136,11 +193,13 @@ def _gate_mix(gate: GateMLP, h_s: Tensor, h_d: Tensor, eps: float = 1e-6) -> Ten
         gate.h2.bias,
         gate.out.weight,
         gate.out.bias,
+        gate.out_scale,
     )
 
 
 class Surface(nn.Module):
-    """The entire trainable state: one tied row plus one bf16 gate."""
+    """The entire trainable state: one tied row plus one gate, held in
+    fp32 master precision over the bf16 base (D2)."""
 
     def __init__(self, model, dot_id: int):
         super().__init__()
@@ -149,8 +208,8 @@ class Surface(nn.Module):
         weight = model.model.embed_tokens.weight
         if weight.dtype != torch.bfloat16:
             raise TypeError(f"training requires BF16 model weights, got {weight.dtype}")
-        self.row = nn.Parameter(weight[dot_id].detach().clone())
-        self.gate = GateMLP(d).to(device=weight.device, dtype=weight.dtype)
+        self.row = nn.Parameter(weight[dot_id].detach().clone().float())
+        self.gate = GateMLP(d).to(device=weight.device, dtype=torch.float32)
 
     def sync_into(self, model) -> None:
         """Write the trained row into the (tied) model embedding, so plain
@@ -162,11 +221,13 @@ class Surface(nn.Module):
 
 def _mix(cfg_eps: float, h_s: Tensor, h_d: Tensor, alpha, beta) -> Tensor:
     # Eq. 1 (norm-matched mix). Semantic twin of RecirculationEngine.mix
-    # in wire.py — keep them in sync. All persistent arithmetic is bf16.
-    ratio = h_d.norm(dim=-1, keepdim=True) / h_s.norm(dim=-1, keepdim=True).clamp_min(
-        cfg_eps
-    )
-    return beta * h_d + alpha * ratio * h_s
+    # in wire.py — keep them in sync. fp32 arithmetic, one cast back to
+    # the residual's dtype at the end.
+    h_s32, h_d32 = h_s.float(), h_d.float()
+    ratio = h_d32.norm(dim=-1, keepdim=True) / h_s32.norm(
+        dim=-1, keepdim=True
+    ).clamp_min(cfg_eps)
+    return (beta * h_d32 + alpha * ratio * h_s32).to(h_d.dtype)
 
 
 def _rope(model, positions: Tensor, dtype) -> dict[str, tuple[Tensor, Tensor]]:
@@ -696,7 +757,7 @@ def think_outputs(
 
     positions = torch.arange(P, T, device=ids.device)
     span_rope = _rope(model, positions, dtype)
-    x = (surface.row.to(dtype) * scale).expand(B, k, -1)
+    x = (surface.row * scale).to(dtype).expand(B, k, -1)
     h_dest = _span_parallel(model, packed, x, span_rope, prompt_kv, 0, dest + 1, ckpt)
 
     n_layers = model.config.num_hidden_layers
@@ -782,7 +843,7 @@ def parallel_outputs(
     )
     positions = torch.arange(P, T, device=ids.device)
     span_rope = _rope(model, positions, dtype)
-    x = (surface.row.to(dtype) * scale).expand(B, k, -1)
+    x = (surface.row * scale).to(dtype).expand(B, k, -1)
     x = _span_parallel(
         model,
         packed,
@@ -804,8 +865,8 @@ def parallel_outputs(
 def _head_ce_chunk(W, row, dot_id, softcap, h, targets):
     batch, span, width = h.shape
     flat = h.reshape(batch * span, width)
-    logits = F.linear(flat, W)
-    dot = F.linear(flat, row.unsqueeze(0))
+    logits = F.linear(flat, W).float()
+    dot = F.linear(flat.float(), row.unsqueeze(0))
     dot_column = torch.full(
         (batch * span, 1), dot_id, dtype=torch.long, device=h.device
     )
@@ -819,7 +880,12 @@ _head_ce_chunk_c = torch.compile(_head_ce_chunk, fullgraph=True, dynamic=False)
 
 
 def head_ce(model, surface: Surface, hiddens: Tensor, targets: Tensor) -> Tensor:
-    """One-shape compiled CE chunks with a live tied `<t>` column."""
+    """One-shape compiled fp32 CE chunks (bf16 GEMM, upcast logits) with a
+    live tied `<t>` column. Each chunk is checkpointed: its fp32
+    [rows, vocab] logits and log-softmax are recomputed in backward (one
+    head GEMM per chunk) instead of being held across the span — at
+    k=32 the unchecked version kept 33 such slabs alive, 9 GB even in
+    bf16 and an OOM in fp32."""
     W = model.lm_head.weight
     softcap = getattr(model.config, "final_logit_softcapping", None)
     B, S, _ = hiddens.shape
@@ -846,13 +912,16 @@ def head_ce(model, surface: Surface, hiddens: Tensor, targets: Tensor) -> Tensor
     parts = []
     for i in range(0, padded, chunk):
         parts.append(
-            _head_ce_chunk_c(
+            checkpoint(
+                _head_ce_chunk_c,
                 W,
                 surface.row,
                 surface.dot_id,
                 softcap,
                 hiddens[:, i : i + chunk],
                 targets[:, i : i + chunk],
+                use_reentrant=False,
+                preserve_rng_state=False,
             )
         )
     return torch.cat(parts, dim=1)[:, :S]
@@ -861,20 +930,33 @@ def head_ce(model, surface: Surface, hiddens: Tensor, targets: Tensor) -> Tensor
 def span_loss(
     model, surface: Surface, hiddens: Tensor, answers: Tensor, lam: float
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """L = CE(answer) + lam * mean(CE(emission)). Emission targets are
-    all `<t>` (initiation + continuation); k-independent task gradient."""
+    """L = CE(answer) + lam * sum(CE(emission)), batch-averaged.
+
+    Every supervised position carries a k-independent weight (1 for the
+    answer, lam per `<t>` target), so the readout at the smallest
+    training k — where a k_min batch's answer and a longer batch's `<t>`
+    meet at the same position — learns P(answer | reached k_min) =
+    P(k_min) / (P(k_min) + lam * sum_{k > k_min} P(k)): at lam=1 the
+    learned halting hazard is the training k distribution (D15). The
+    former mean over emission positions weighed each `<t>` target lam/k,
+    which pinned greedy halting at k_min for any k tail. Emission targets
+    are all `<t>` (initiation + continuation); the task gradient flows
+    only through the answer. Returns (loss, per-example answer CE,
+    per-position emission CE)."""
     B, S, _ = hiddens.shape
     targets = torch.full((B, S), surface.dot_id, device=hiddens.device)
     targets[:, -1] = answers
     ce = head_ce(model, surface, hiddens, targets)
     ce_ans, ce_emit = ce[:, -1].mean(), ce[:, :-1].mean()
-    return ce_ans + lam * ce_emit, ce_ans, ce_emit
+    return ce_ans + lam * (S - 1) * ce_emit, ce_ans, ce_emit
 
 
 def answer_logits_from(model, surface: Surface, hiddens: Tensor) -> Tensor:
+    """fp32 full-vocab readout at the last supplied position with the live
+    tied `<t>` column (D11: everything measured is fp32)."""
     hidden = hiddens[:, -1]
-    logits = F.linear(hidden, model.lm_head.weight)
-    dot = F.linear(hidden, surface.row.unsqueeze(0))
+    logits = tasks.fp32_logits(hidden, model.lm_head.weight)
+    dot = F.linear(hidden.float(), surface.row.unsqueeze(0))
     column = torch.full(
         (hidden.shape[0], 1), surface.dot_id, dtype=torch.long, device=hidden.device
     )
@@ -989,7 +1071,7 @@ def reference_outputs(
     h_init, prompt_kv = _prompt_prefill(model, packed, ids[:, :P])
     positions = torch.arange(P, T, device=ids.device)
     rope = _rope(model, positions, dtype)
-    e = (surface.row.to(dtype) * scale).expand(B, 1, -1)
+    e = (surface.row * scale).to(dtype).expand(B, 1, -1)
 
     layer_types = model.config.layer_types
     slab = range(dest + 1, n_layers)
@@ -1160,8 +1242,10 @@ def gate_mode(args) -> None:
     # activates the complete MLP so the gate checks every trainable tensor.
     with torch.no_grad():
         generator = torch.Generator(device=surface.row.device).manual_seed(1729)
+        # std scales with d so the pre-sigmoid perturbation matches the
+        # unscaled-output gate this check was calibrated on.
         surface.gate.out.weight.normal_(
-            std=1e-3,
+            std=1e-3 / surface.gate.out_scale,
             generator=generator,
         )
     lp1, gp1 = _loss_and_grads(functional, surface)
@@ -1177,8 +1261,9 @@ def gate_mode(args) -> None:
         h = parallel_outputs(model, surface, ids, start)
         ours = answer_logits_from(model, surface, h)
         hf = model(ids, logits_to_keep=1).logits[:, -1]
+    ours = ours.to(hf.dtype)  # compare inside the HF head's own rounding
     mean = float((ours - hf).abs().mean())
-    top1 = float((ours.argmax(-1) == hf.argmax(-1)).to(torch.bfloat16).mean())
+    top1 = float((ours.argmax(-1) == hf.argmax(-1)).float().mean())
     print(f"span-drive vs HF forward: mean|dlogit| {mean:.3e}, top1 {top1:.4f}")
 
     # Measured 2026-08-21 (B=2, parity len 4, k=3): rerun null 0 (bitwise
@@ -1227,7 +1312,9 @@ def evaluate_sweep(
     return {k: (result["acc"], result["legal"]) for k, result in results.items()}
 
 
-def _lr_at(step: int, args) -> float:
+def _lr_at(
+    step: int, args, peak: float | None = None, floor: float | None = None
+) -> float:
     """Learning rate as a pure function of the within-run step (D15).
 
     ``--cosine`` is the total scheduled horizon: its first ``--warmup``
@@ -1235,15 +1322,21 @@ def _lr_at(step: int, args) -> float:
     and later steps stay at the floor. The horizon is independent of
     ``--steps``, and curriculum stages reset schedules by being separate
     runs (D6). ``--cosine 0`` is flat at the peak from the first step.
+
+    ``peak``/``floor`` override ``args.lr``/``args.lr_floor`` for a
+    param group on its own scaled copy of the same shape (the gate runs
+    the row's schedule scaled by gate_lr/lr, so warmup and cosine align).
     """
+    peak = args.lr if peak is None else peak
     if not args.cosine:
-        return args.lr
+        return peak
+    floor = args.lr_floor if floor is None else floor
     warmup_steps = int(args.warmup * args.cosine)
     if step < warmup_steps:
-        return args.lr * step / max(warmup_steps, 1)
+        return peak * step / max(warmup_steps, 1)
     decay_steps = args.cosine - warmup_steps
     t = min((step - warmup_steps) / decay_steps, 1.0)
-    return args.lr_floor + (args.lr - args.lr_floor) * 0.5 * (1 + math.cos(math.pi * t))
+    return floor + (peak - floor) * 0.5 * (1 + math.cos(math.pi * t))
 
 
 def _step_choice(
@@ -1310,7 +1403,7 @@ def _save_checkpoint(path: str, surface, opt, args, step: int) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(target.suffix + ".tmp")
     payload = {
-        "version": 1,
+        "version": CHECKPOINT_VERSION,
         "step": step,
         "surface": surface.state_dict(),
         "optimizer": opt.state_dict(),
@@ -1325,15 +1418,20 @@ def _save_checkpoint(path: str, surface, opt, args, step: int) -> None:
 
 def _load_checkpoint(path: str, surface, opt) -> int:
     checkpoint_state = torch.load(path, map_location="cuda", weights_only=False)
-    if checkpoint_state.get("version") != 1:
-        raise ValueError(f"unsupported checkpoint version in {path}")
+    version = checkpoint_state.get("version")
+    if version != CHECKPOINT_VERSION:
+        raise ValueError(
+            f"unsupported checkpoint version {version} in {path} (want "
+            f"{CHECKPOINT_VERSION}: v1 surfaces are bf16 with an unscaled gate "
+            "output and do not cross the precision boundary)"
+        )
     wrong_dtype = {
         name: tensor.dtype
         for name, tensor in checkpoint_state["surface"].items()
-        if tensor.is_floating_point() and tensor.dtype != torch.bfloat16
+        if tensor.is_floating_point() and tensor.dtype != torch.float32
     }
     if wrong_dtype:
-        raise TypeError(f"checkpoint surface is not wholly BF16: {wrong_dtype}")
+        raise TypeError(f"checkpoint surface is not wholly fp32: {wrong_dtype}")
     surface.load_state_dict(checkpoint_state["surface"], strict=True)
     opt.load_state_dict(checkpoint_state["optimizer"])
     random.setstate(checkpoint_state["python_rng"])
@@ -1413,7 +1511,24 @@ def run_mode(args) -> None:
     tok, model = load_model(args.model, "cuda")
     dot_id = tasks.single_token(tok, tasks.DOT)
     surface = Surface(model, dot_id).cuda()
-    opt = torch.optim.AdamW(surface.parameters(), lr=args.lr, weight_decay=0.0)
+    # The gate rides a fraction of the row's lr on the same warmup/cosine
+    # shape (D15, --gate-ratio): the 1/d output scale slowed the coherent
+    # AdamW logit drift but left no restoring force, so a smaller gate step
+    # keeps the pre-sigmoid in the live band over a long horizon. The ratio
+    # scales peak and floor alike, so the two groups warm and decay
+    # together. Each group carries its own (peak, floor); the step loop
+    # drives them, so resume stays a pure function of step.
+    gate_peak = args.lr * args.gate_ratio
+    gate_floor = args.lr_floor * args.gate_ratio
+    opt = torch.optim.AdamW(
+        [
+            {"params": [surface.row], "peak": args.lr, "floor": args.lr_floor},
+            {"params": list(surface.gate.parameters()), "peak": gate_peak,
+             "floor": gate_floor},
+        ],
+        lr=args.lr,
+        weight_decay=0.0,
+    )
     task_list = args.tasks.split(",")
     k_set = [int(s) for s in args.k.split(",")]
     train_k = [int(s) for s in args.train_k.split(",")]
@@ -1440,11 +1555,20 @@ def run_mode(args) -> None:
         resume_path = args.out if args.resume == "auto" else args.resume
         start_step = _load_checkpoint(resume_path, surface, opt) + 1
         print(f"resumed {resume_path} at step {start_step - 1}")
+        # load_state_dict copies the saved param-group hyperparameters;
+        # peak/floor are schedule config, not checkpoint state (D15), so
+        # re-assert them from args — the lr stays a pure function of step.
+        for group, (peak, floor) in zip(
+            opt.param_groups,
+            [(args.lr, args.lr_floor), (gate_peak, gate_floor)],
+        ):
+            group["peak"], group["floor"] = peak, floor
     print(
         f"condition {args.condition}, tasks {task_list}, eval k {k_set}, "
         f"train k {train_k} (P~k^{args.k_gamma:g}), B {args.batch}, "
-        f"lr {args.lr:g} cosine {args.cosine} warmup {args.warmup:g} "
-        f"({int(args.warmup * args.cosine)} steps) floor {args.lr_floor:g}"
+        f"lr {args.lr:g} (gate x{args.gate_ratio:g}) cosine {args.cosine} "
+        f"warmup {args.warmup:g} ({int(args.warmup * args.cosine)} steps) "
+        f"floor {args.lr_floor:g}"
     )
 
     producer = _BatchProducer(tok, args, task_list, train_k, start_step, k_weights)
@@ -1539,9 +1663,8 @@ def run_mode(args) -> None:
                 parameter.grad is not None for parameter in model.parameters()
             ):
                 raise RuntimeError("frozen base model accumulated a gradient")
-            lr_now = _lr_at(step, args)
             for group in opt.param_groups:
-                group["lr"] = lr_now
+                group["lr"] = _lr_at(step, args, group["peak"], group["floor"])
             opt.step()
             completed_step = step
             if step % args.log_every == 0:
@@ -1629,6 +1752,16 @@ def main() -> None:
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument(
+        "--gate-ratio",
+        type=float,
+        default=0.1,
+        help="gate-MLP lr as a fraction of --lr (D15): the gate trains at "
+        "gate_ratio*--lr on the row's warmup/cosine shape, floor included, "
+        "in its own param group. Below 1 because the 1/d-scaled gate output "
+        "still has no restoring force against AdamW's coherent drift; 1 puts "
+        "the gate on the row's schedule, 0 freezes it at the paper init",
+    )
+    p.add_argument(
         "--cosine",
         type=int,
         default=2000,
@@ -1640,10 +1773,10 @@ def main() -> None:
     p.add_argument(
         "--lam",
         type=float,
-        default=0.125,
-        help="emission-span CE weight (D15): the hazard calibrates at any "
-        "weight, and a small one damps the per-batch dot/answer pressure on "
-        "the tied row",
+        default=1.0,
+        help="per-position weight of the emission-span CE against 1 for the "
+        "answer (D15); at 1 the loss is the plain token-level LM loss and the "
+        "learned halting hazard equals the training k distribution",
     )
     p.add_argument(
         "--warmup",

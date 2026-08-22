@@ -8,24 +8,24 @@ RTX 4090.
 
 ## Wire correctness (Gate G0)
 
-**Identity — PASS** (re-witnessed 2026-08-21 at `e80af1c`): the α=0
-two-pass engine vs the plain HF forward measures mean |Δlogit|
-5.80e-2, top-1 0.9746, ppl 27.0229 → 27.0575 (rel 1.3e-3) — inside
-the calibrated bf16 null (kernel-tiling self-noise ~5.5e-2 / 0.965;
-machinery bugs sit ~20× higher and scramble top-1). The retired fp32
-reference proved the same algorithm exact at max |Δlogit| 1.2e-4.
+**Identity — PASS** (re-witnessed 2026-08-22 on the precision-split
+tree, unchanged to print resolution): the α=0 two-pass engine vs the
+plain HF forward measures mean |Δlogit| 5.80e-2, top-1 0.9746, ppl
+27.0229 → 27.0575 (rel 1.3e-3) — inside the calibrated bf16 null
+(kernel-tiling self-noise ~5.5e-2 / 0.965; machinery bugs sit ~20×
+higher and scramble top-1). The retired fp32 reference proved the same
+algorithm exact at max |Δlogit| 1.2e-4.
 
-**Perplexity repro — PASS.** Untrained recirculation, 100×512-token
-windows, α=0.15, ramp 10: **PG19 −9.00%, C4 −5.09%** against the
-paper's −14.4% (at 1024-token windows) and −3.9%. Controls from the
-first measurement round: {10,3} (the 1-indexed reading) keeps only
-~−1.5%, adjacent {8,7} ~−0.5% — we are on the paper's landscape, the
-pair is 0-indexed, and the landscape is sharp. Each dataset scores in
-2.1 s at B=512 with zero timed recompiles.
+**Perplexity repro — PASS** (re-witnessed 2026-08-22, unchanged).
+Untrained recirculation, 100×512-token windows, α=0.15, ramp 10:
+**PG19 −9.00%, C4 −5.09%** against the paper's −14.4% (at 1024-token
+windows) and −3.9%. Controls: {10,3} (the 1-indexed reading) keeps
+only ~−1.5%, adjacent {8,7} ~−0.5% — we are on the paper's landscape,
+the pair is 0-indexed, and the landscape is sharp. Each dataset scores
+in 2.1 s at B=512 with zero timed recompiles.
 
-Interpretation unchanged since day one: the untrained wire is real,
-clearly positive, in the paper's ballpark, and specific to the
-characterized layer pair.
+The untrained wire is real, clearly positive, in the paper's ballpark,
+and specific to the characterized layer pair.
 
 ## Wire throughput (inference path)
 
@@ -35,13 +35,15 @@ windows, 32.7k tok/s, 10.15 GiB peak**; B=128 — 2.35 s, 27.9k tok/s,
 timed evaluation; cold compile+capture ~25 s from an empty Inductor
 cache, ~6.5 s with the persistent cache. The full untrained task-grid
 preparation (largest shape first, eight prefill lengths) is 49.4 s
-cold at B=512 and passes Dynamo's default recompile guard.
+cold at B=512 and passes Dynamo's default recompile guard. (The
+answer-position readout is now fp32; the teacher-forced NLL path these
+numbers time is unchanged.)
 
 ## Tasks: untrained baseline (the money plot's zero line)
 
-Full grid 2026-08-20, historical full-scope wire arms (today's
-labels: `none`, `full-wire`, `dots`, `dots+full-wire`, `cot`),
-4 tasks × k ∈ {1,2,4,8,16,32}, n=512, seed 0:
+Full grid 2026-08-20, 4 tasks × k ∈ {1,2,4,8,16,32}, n=512, seed 0
+(labels: `none`, `full-wire`, `dots`, `dots+full-wire`, `cot`); the
+readout is fp32 (below):
 
 - **Accuracy at chance everywhere.** No untrained condition computes
   anything. Constant-in-k cells (threesum 0.518, reachability ~0.525)
@@ -60,163 +62,137 @@ labels: `none`, `full-wire`, `dots`, `dots+full-wire`, `cot`),
   helps.
 - **The wire's ppl gain shows through the task lens**: gold_lp
   improves under the wire in nearly every matched pair (s5 −8.54 →
-  −7.18; reachability −8.52 → −7.92; dots vs dots+wire likewise at
-  small k), while untrained dots cost gold_lp (settling near −18 for
-  k≥2: untrained `<unused0>` rows push the readout
-  off-distribution).
+  −7.18; reachability −8.52 → −7.92), while untrained dots cost
+  gold_lp (settling near −18 for k≥2: untrained `<unused0>` rows push
+  the readout off-distribution).
+- **The untrained margin is near-linear in the bits.** For parity the
+  label-logit margin regresses on the input bits at R² 0.94 (length
+  16), corr 0.53 with the number of ones — so short-length "above
+  chance" is that linear readout landing on the right side, not
+  parity. At length 4 the base model reaches acc 0.57 (k=1) to 0.63
+  (k=32); every short-length accuracy must be read as Δ over the per-k
+  untrained row, not over 0.5.
 
-Every trained gain will be read against this row. The think-scope
-training null (`dots+think-wire`) shares the structural facts —
-untrained row, legality 0, chance accuracy — and is recorded per-run
-by each training job's step-0-equivalent eval.
+Every trained gain is read against this row. The think-scope training
+null (`dots+think-wire`) shares the structural facts — untrained row,
+legality 0, chance accuracy — and is recorded per-run by each training
+job's step-0-equivalent eval.
+
+## Readout precision (D11)
+
+Every readout — forced-choice label logits, the legality argmax, and
+gold_lp — is fp32 over the bf16 hidden (`tasks.fp32_logits`, chunked
+over the vocabulary). This is load-bearing at the trained head's logit
+scale: trained readouts push label logits to ~20, where a bf16 logit's
+ulp is 0.125 — wider than the forced-choice margins it decides. A bf16
+sweep of a trained surface produced ~8 distinct margins and ~40% exact
+ties on 512 instances (`argmax` breaks ties toward label index 0); the
+fp32 sweep restores full resolution. Re-scoring past checkpoints
+through the fp32 head did not move any reported accuracy (the ties fell
+on both sides), but the instrument had been one ulp wide.
 
 ## Training path correctness (gradient gate)
 
-**PASS** (re-witnessed 2026-08-21 at `3572c0a` under D15's λ=0.125,
-B=2, parity len 4, k=3): functional loss 12.875000 = rerun
-(bitwise-deterministic at this shape) = reference at bf16 print
-resolution; grad max-rel vs the independent reference 2.698e-2
-zero-init (2.271e-2 at λ=1) and 5.176e-2 with the perturbed gate (the
-second state activates the hidden MLP layers that zero-init blocks);
-span drive vs the plain HF forward mean |Δlogit| 9.42e-2, top-1
-1.0000. All inside the pinned thresholds (design.md:
-Gates), which sit in the gap between measured kernel noise and the
-O(0.5+) scale a deliberately broken visibility set produces. The
-max-k sweep readout agrees with standalone execution at 100%
-full-vocab top-1, mean |Δlogit| 0.047–0.056 (the established tiling
-null). All 15 project tests pass on jobe; the Mac runs the 7
+**PASS** (re-witnessed 2026-08-22 on the precision-split tree: fp32
+surface and optimizer state, 1/d-scaled gate output, fp32 CE, λ=1 per
+emission position; B=2, parity len 4, k=3): functional loss 67.254745
+= rerun (bitwise-deterministic at this shape) vs reference 67.276848
+(rel 3.3e-4 — the loss sums three emission positions at weight 1);
+grad max-rel vs the independent reference 3.637e-2 zero-init and
+3.491e-2 with the perturbed gate (whose std scales with d so its
+pre-sigmoid effect matches the calibration; that state activates the
+hidden MLP layers zero-init blocks); span drive vs the plain HF
+forward mean |Δlogit| 9.42e-2, top-1 1.0000, compared inside the HF
+head's own bf16 rounding. All inside the pinned thresholds (design.md:
+Gates). The max-k sweep readout agrees with standalone execution at
+100% full-vocab top-1, mean |Δlogit| 0.047–0.056 (the established
+tiling null). All 18 project tests pass on jobe; the Mac runs the 8
 model-free ones and skips the rest.
 
 ## Training path throughput
 
-One optimizer step, parity, forward + full-vocab emission-span loss +
-backward + AdamW, effective B=512 under the internal automatic
-activation-checkpoint policy:
+**Stale as of 2026-08-22** — the peak-memory column predates the fp32
+surface and the CE-slab checkpointing (which cut the largest-k peak to
+~12.5 GiB); step times are approximately unchanged but unremeasured
+under the new recipe. One optimizer step, parity, forward + full-vocab
+emission-span loss + backward + AdamW, effective B=512 under the
+internal automatic activation-checkpoint policy:
 
-| k | plan | step | throughput | peak |
+| k | plan | step | throughput | peak (pre-fix) |
 |---|---|---|---|---|
 | 8 | 2 × B=256, retained | 1.06 s | 483 ex/s | 13.1 GiB |
 | 16 | B=512, 4 layers retained | 2.03 s | 253 ex/s | 18.0 GiB |
 | 32 | B=512, full recompute | 4.02 s | 127 ex/s | 17.8 GiB |
 
-Against the pre-audit baseline (B=64, k=4): 290.9 → 98.7 ms/step
-(**2.95×**), peak 6.38 → 3.54 GiB, and the 1.86 GiB of gradients the
-baseline accumulated for frozen base Parameters is now structurally
-zero (checked at step 1). Periodic evaluation uses the max-k sweep
-(2.92× over per-k executions) with the pinned-host prompt-state LRU
-(a further 1.48× on repeated sweeps, bitwise-equal hiddens). The
-batch producer never starves the GPU (worst observed wait 18 µs
-behind a 150 ms step). Training warms every configured k before the
-clock (38 graphs for dots+wire, 16 for dots, full default k set) and
-compiles nothing inside steps — the audit that enforces this caught
-two real warm-coverage holes at launch (journal 2026-08-21).
+The 1.86 GiB of gradients the pre-audit baseline accumulated for
+frozen base Parameters is structurally zero (checked at step 1).
+Periodic evaluation uses the max-k sweep (2.92× over per-k executions)
+with the pinned-host prompt-state LRU (a further 1.48× on repeated
+sweeps, bitwise-equal hiddens). The batch producer never starves the
+GPU (worst observed wait 18 µs behind a 150 ms step). Training warms
+every configured k before the clock and compiles nothing inside steps.
 
-## First H2 probe: parity at v0 scale (2026-08-21)
+## Tasks: training to date (all under a dead gate)
 
-Both arms trained at defaults from `8020e51`: parity (length 32),
-think scope, 2000 steps × effective B=512 (~1M examples), k sampled
-uniformly from {1,2,4,8,16,32}, lr 1e-3, λ=1; wire arm ~50 min, dots
-~22 min, clean audits throughout. In-run eval sweeps: accuracy at
-chance every 500 steps in both arms. Post-hoc scoring of the final
-surfaces (n=512, eval seed 0; `logs/posthoc-parity.log` on jobe) —
-sweep with gold_lp plus the D14 free-running readout, against the
-untrained think-scope null and a transfer cell (wire-trained surface
-executed *without* the wire):
+Every training run through 2026-08-22 was made before the precision
+fixes below, and post-hoc probing showed the gate MLP had saturated to
+a constant, input-independent binary mask within ~500 steps in all of
+them (α, β exactly 0/1 per dim, cross-instance std of α exactly
+0.0000; ~45% pass-through, ~22% +source, ~9% source-only, ~23% zeroed;
+the mechanism is in the journal, 2026-08-22). So the prior results
+characterize the reduced model "trained `<t>` row + fixed mask", not
+H3's adaptive gate — which has not yet been exercised on a task. Read
+them accordingly:
 
-| surface / arm | acc | legal (k≥4) | gold_lp (k≥4) | free-running (greedy) |
-|---|---|---|---|---|
-| untrained / either | chance | 0.000 | −9..−11 | halts at k=1, 0% legal |
-| **wire / think** | chance | 1.000 | **−0.72..−0.79** | halt 1.00, k~4, 100% legal |
-| **wire / dots** (transfer) | chance | 0.000 | −3.7..−9.1 | never halts |
-| dots / dots | chance | 1.000 | −0.72..−0.79 | halt 1.00, k~4, 100% legal |
+- **parity lengths 16 and 32: no task signal.** Accuracy at chance at
+  every k and every training length (n=512), answer CE on the ln-2
+  calibrated-ignorance floor; the length-16 margin correlates −0.06
+  with parity. Everything *around* the task trained — legality → 1.0,
+  a wire-dependence signature (the same surface scored wire-free:
+  gold_lp −0.72 → −8..−9, greedy halting 1 → never), and self-halting
+  — but the parity function did not emerge, and at length 16 the
+  trained readout even *removed* the base model's bit-linear structure
+  (R² 0.94 → 0.15) toward calibrated ignorance.
+- **parity length 4: a memorization signal, wire-only.** wire-trained
+  + wire-run reached acc 0.752 at k=32 (12 of the 16 distinct length-4
+  instances; one-sided p ≈ 0.04), monotone in k, the one cell above
+  the ln-2 floor (gold_lp −0.62), holding under the fp32 readout. No
+  other arm beats the per-k untrained baseline, and there is no length
+  transfer (5/6/8 fall to the null) — a length-4 lookup. The mechanism
+  still counts: the surface sees the input only through recirculated
+  hiddens, so even a lookup certifies input-dependent routing through
+  the wire.
 
-Readings:
+Two caveats now on the record: at length 4 the 512 draws are 16
+distinct instances, so accuracy is quantized to 1/16 (±0.125 under a
+coin) and the n=512 SE never applied; and the halting "at k~4" in
+every run was loss-weighting arithmetic (`λ·mean` cancels the fat tail
+against the answer term), not learned timing — the per-position `λ·Σ`
+form (D15) is what makes the hazard track the training k distribution.
 
-1. **H2 signal absent at this scale.** Accuracy is chance in every
-   trained cell; answer CE sits on the ln 2 calibrated-ignorance
-   floor (gold_lp ≈ −0.69). The surfaces learned everything *about*
-   answering — emission, calibration, stopping — and nothing about
-   parity.
-2. **The learned surface is wire-dependent** — the probe's genuinely
-   new fact. With the same wire-trained surface, gold_lp is identical
-   across wire/no-wire arms at k≤2 (−1.570/−1.586 — structurally
-   forced: the first refreshed column only becomes visible to a
-   readout at t=3, so this equality doubles as a live semantics
-   cross-check), then collapses without the wire at k≥4: −0.72 →
-   −3.7..−9.1, legality 1.0 → 0.0, greedy halting 100% → never. The
-   gate and row learned to keep the readout calibrated *through
-   recirculated state*, not through the row alone. Dependence, not
-   yet superiority: the dots-trained arm reaches the same floor
-   wire-free.
-3. **Halting works (D4/D14).** Both trained arms self-halt greedily
-   at k~4 with 100% legality (soft E[k|halt] ≈ 2.0–2.3), against an
-   untrained null that "halts" immediately on an illegal token.
-   Trained on uniform k, the learned hazard is front-loaded — the
-   forced-sweep legality zeros at k≤2 are this hazard seen from the
-   other side.
+## Precision + gate fixes (2026-08-22): in, gate-verified, unproven on task
 
-Interpretation: the machinery is green end to end — gradients flow,
-the stopping hazard trains, the gate routes wire state — but the task
-computation did not emerge in 2000×512 at serial depth 32, which is
-the maximally hard depth for the k≤32 budget. Next probes, in order
-of information per GPU-hour: task-difficulty scaling (shorter parity
-lengths — a curriculum over difficulty, not trace supervision, so H3
-stays intact) and longer optimization.
-
-## Parity length 4: first learned signal (2026-08-21)
-
-Difficulty-scaling probe: `--knobs length=4`, standard v0 recipe
-(flat LR, uniform k over {1..32}), both arms, 2000×512, snapshots
-every 500. Post-hoc at n=512 seed 0 (`logs/posthoc-parity4.log`,
-`logs/posthoc-parity4-transfer.log` on jobe). Three results:
-
-1. **The untrained baseline is not at chance at length 4.** Frozen
-   Gemma, forced choice: acc 0.568 at k=1 up to 0.631 at k=32
-   (SE ≈ 0.022) — with legality 0.00 and gold_lp −7..−10. The base
-   model carries parity-of-4-bits signal in its label-logit margins
-   while its output distribution is garbage. Every len-4 accuracy
-   must be read as Δ over the per-k untrained row, not over 0.5.
-2. **Wire-trained + wire-run beats that baseline; nothing else
-   does.** wire/think at step 2000: acc 0.568/0.568/0.629/0.752 at
-   k=4/8/16/32 (monotone in k), legality 1.00, and gold_lp −0.62 at
-   k=32 — the only cell above the ln 2 calibrated-ignorance floor
-   (~54% gold mass; argmax amplifies to 0.75). dots/dots matches the
-   *untrained* accuracy pattern with legality dressed on top and
-   gold_lp never above floor. Transfers fail both directions:
-   wire-trained scored wire-free collapses to the null (gold_lp
-   −3..−6); dots-trained given the wire *degrades* at high k.
-3. **The signal emerged entirely in steps 1500→2000** (k=32
-   trajectory: 0.486 → 0.492 → 0.492 → 0.752) — a late phase change
-   after ~1500 steps in the calibration/legality/hazard basin, cut
-   off mid-climb. Undertraining is confirmed, not just suspected.
-
-**No length transfer.** The step-2000 wire surface scored at lengths
-5/6/8: accuracy at the untrained null, gold_lp back *below* floor
-(−0.8..−2.1 — confidently miscalibrated off-distribution), legality
-partially collapsed. With 2⁴ = 16 distinct instances (B=512 sees the
-whole space ~32× per step — effectively full-batch GD), the learned
-solution is a length-4-specific lookup. The mechanism is still the
-point: the surface never sees the input except through recirculated
-hiddens, so even memorization certifies input-dependent routing
-through the wire — H2's mechanism at work, without H2's algorithm.
-
-Free-running texture: the trained wire arm greedily halts at k~3.8
-(100% legal, free acc 0.568 ≈ its forced k=4 accuracy) — it halts
-well before its own competence peak at k=32. The hazard trained on
-uniform k learned "halt around 4"; the capability lives at 32. That
-mismatch motivated D15's fat-tailed training k.
-
-Watch-items: legality at small k is *bistable* over training (both
-arms oscillate 0 ↔ 1.0 across evals under flat lr 1e-3) — any single
-eval's legality is a snapshot of that oscillation; and one stray
-transfer cell (dots at len5/k32: 0.637) has no k- or length-trend
-and awaits replication before it means anything.
+The fixes — fp32 surface/optimizer/gate-math/CE/readout over the bf16
+base; the gate pre-sigmoid scaled by 1/d; `λ·Σ CE(emit)` at λ=1; and a
+per-group gate lr (`--gate-ratio`, default 0.1) — are on the working
+tree with G0 identity/repro and the gradient gate re-witnessed above. A
+200-step timeline confirms the gate is alive for the first time: at
+gate-ratio 1.0 the cross-instance std of α rises 0 → 0.0035 (exactly 0
+in every prior run) with the median pre-sigmoid held at the paper init
+and a small saturation tail by step 200; at ratio 0.1 it stays 100%
+unsaturated but had not engaged by step 200 (slower pacing, same
+headroom). No task run has been made under the corrected recipe yet —
+checkpoint version 2 does not load the pre-fix surfaces.
 
 ## Next
 
-Rerun parity4 under D15 (cosine to floor, train-k {2..32} with
-P∝k, longer budget) — does the phase change move earlier, stabilize,
-saturate; does transfer ever emerge (grokking watch). Then len 8/16
-with proper budgets (2⁸/2¹⁶ instances progressively close the
-memorization escape), the remaining tasks per-task, the mixture
-(F4), and full scope (wire-alone arm + α-migration readout).
+Rerun parity4 under the corrected recipe (live gate, exact hazard,
+fp32 readout; ~30 min) — the cheapest test of whether the gate
+mattered — then parity16. Length 16 under answer-only supervision also
+faces a task-design question the gate fix does not touch: uniform-bit
+parity has no partial credit (a scan that XORs 15 of 16 bits is
+uncorrelated with the label), so at chance the gradient is noise unless
+the features already depend on all bits jointly; options are biased
+bits, mixed-length batches that force a scan, or a task with partial
+credit. Then the remaining tasks per-task, the mixture (F4), and full
+scope (wire-alone arm + α-migration readout).

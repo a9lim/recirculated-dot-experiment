@@ -1,7 +1,7 @@
 # scripts/lab.sh queue scripts/example-queue.txt
 # TAG <train args> [| <score args>]   — one run per line, in order.
 # Parity length 16 under D15: an 8000-step schedule horizon (5% warmup),
-# then 2000 steps at the floor; train-k {4..32} with P~k, lam 0.125,
+# then 2000 steps at the floor; train-k {4..32} with P~k, lam 1 (per emission position),
 # snapshots every 500, and a length-transfer readout. The wire arm is active;
 # the dots control is parked below.
 parity16-wire --condition dots+wire --knobs length=16 --steps 10000 --cosine 8000 --snapshot-every 500 --eval-n 512 | --transfer length=8,12,16

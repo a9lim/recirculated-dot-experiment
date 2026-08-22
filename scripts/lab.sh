@@ -96,8 +96,13 @@
 #                            implies no warmup.
 #   --lr-floor X             Post-cosine learning-rate floor (default 1e-4;
 #                            unused when --cosine 0).
-#   --lam X                  Weight of mean emission-span CE in
-#                            CE(answer)+X*mean(CE(emission)) (default 0.125).
+#   --lam X                  Per-position weight of the emission-span CE in
+#                            CE(answer)+X*sum(CE(emission)) (default 1: the
+#                            plain token-level LM loss).
+#   --gate-ratio X           Gate-MLP lr as a fraction of --lr (default 0.1;
+#                            the row uses --lr). The gate trains at
+#                            gate_ratio*--lr on the row's warmup/cosine shape,
+#                            floor included.
 #   --seed N                 Training RNG seed (default 0): controls initialization,
 #                            task/k choice, and addressable online examples; the
 #                            checkpoint also preserves Python/Torch/CUDA RNG state.

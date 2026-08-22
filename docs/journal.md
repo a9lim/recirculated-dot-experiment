@@ -454,3 +454,160 @@ floor is reached at step 2000; a 3000-step run therefore has a 1000-step flat
 tail. `--cosine 0` is flat at peak from the first step and implies zero warmup.
 This changes the schedule encoded by pre-change checkpoints, so runs do not
 resume across this boundary.
+
+## 2026-08-22 — parity16 null; the gate had been dead all along
+
+a9 ran `parity16-wire` overnight through the queue (10000 × 512, len
+16, D15 at `ffa8cfa`) and asked what gave: accuracy at chance at every
+k, every snapshot, every transfer length. The run itself was clean.
+Three layers came out of the post-mortem, each with its own numbers in
+findings.
+
+1. *The task never moved*, same shape as the len-32 null: legality,
+   calibration, wire-dependence, halting all trained; answer CE sat on
+   ln 2. The late CE-by-k table (0.776/0.732/0.713/0.697) turned out
+   to be ln 2 plus a halting leak that the loss weighting predicts
+   exactly — which was the first clue that the "learned" hazard was
+   arithmetic: `λ·mean` weighs each `<t>` target λ/k against 1 for the
+   answer, P∝k cancels the 1/k, and the dot-4 readout learns
+   p(answer) ≈ 0.91 at any γ. Greedy halt at 4.0 in every run was that.
+2. *The gate was dead.* Recording α, β per dot position on the
+   snapshots: exactly 0 or 1 per dimension, identical across instances,
+   weights frozen from step ≤2000, pre-sigmoid logits at ±100. Same
+   signature in parity-wire (len 32) and parity4-wire. A 200-step
+   replica with snapshots every 10 put the death between steps 200 and
+   500: AdamW's lr-sized per-entry steps on the zero-init 1152-fan-in
+   output layer drift the logits coherently (lr·Σ|a| per step), warmup
+   lifts lr into that, bf16 rounds σ to exactly 1 from z ≥ 6.25, and
+   the gradient is gone. Every run the project has made trained
+   "constant binary mask + row" — H3's gate has never been exercised.
+3. *bf16 was eating the optimizer.* `gate.out.bias` and `norm.weight`
+   never moved in any run (AdamW steps below half an ulp at magnitude
+   ≥ 1), the row freezes in part at the 1e-4 floor, and the bf16 second
+   moment cannot decay at all. And the forced-choice readout had become
+   one bf16 ulp wide at the trained logit scale — eight distinct margins
+   and 40% exact ties on parity16's final sweep, ties resolved to label
+   index 0. Re-scoring parity4 through an fp32 readout kept its 12/16 at
+   step 2000 (and moved @500 from 0.486 to 0.566); the len-4 claim
+   survives precision but is thinner than findings had said — 16
+   instances, accuracy quantized to 1/16, p ≈ 0.04 against a coin.
+
+a9's calls: fp32 for everything trained or measured (surface, AdamW
+state, gate arithmetic, CE, readouts — the base stays bf16 and the
+identity/repro gates did not move a digit), λ default to 1, and scale
+the gate's pre-sigmoid output. The seat chose 1/d for the scale (the
+Adam output-layer multiplier: with it the logit drift per step is
+O(lr) instead of O(lr·d)). On λ the seat deviated from the literal
+ask, flagged: λ=1 under the existing mean leaves p(answer | dot 4) at
+0.57, still a greedy halt at 4; the form that makes D15's hazard true
+is the per-position sum, `CE(ans) + λ·Σ CE(emit)`, where λ=1 is the
+plain token-level LM loss and the learned hazard equals the training
+P(k). The sum makes per-step gradient magnitude grow with k (up to
+33× the answer term at k=32); under Adam that mostly washes out, and
+a per-step normalization would have broken the exactness again. The
+untrained-model margin also turned out to be a near-linear function
+of the bits (R² 0.94 at len 16) — the "above chance at len 4" null in
+findings is that linear readout landing on 9–10 of 16 instances.
+
+Checkpoint version 2; v1 surfaces refuse to load (bf16, unscaled gate
+— their stored `out.W` means something else under 1/d). The gradient
+gate re-witnessed at loss 67.2547 vs 67.2768, grads 3.64e-2 / 3.49e-2;
+identity and repro unchanged to print resolution. a9 makes the
+commits; jobe got the working tree by rsync for the gates. TF32 is
+deliberately left off — inductor warns about it on every fp32 matmul,
+and that warning is the point.
+
+Lesson for the logbook: "BF16 throughout" read as a simplicity
+virtue and was a silent trainability bug in three places at once;
+the cheap probes (α per position, bias norms across checkpoints,
+distinct-margin counts) would have caught each on day one and now
+live as the first thing to run on a new surface.
+
+## 2026-08-22 — the precision fix, and validating a live gate
+
+Same day, after the parity16 post-mortem above. Landed the three-part
+fix a9 signed off on, in one working tree (a9 commits it; jobe got the
+tree by rsync since the runs precede the commit):
+
+- **fp32 for everything trained or measured**, bf16 base unchanged: the
+  surface row + gate are fp32 master weights, AdamW state fp32, the gate
+  MLP arithmetic fp32 (mix casts once back to the residual dtype), the
+  span CE fp32 (bf16 GEMM, logits upcast, fp32 log-softmax), and every
+  forced-choice/free-running readout fp32 via a new `tasks.fp32_logits`
+  chunked over the 262k vocab. Checkpoint version 2; v1 surfaces refuse
+  to load (they are bf16 with an unscaled gate, a different meaning of
+  `out.W`). The identity and repro gates did not move a printed digit —
+  the base path is bit-for-bit what it was.
+- **gate pre-sigmoid scaled by 1/d** (`GateMLP.out_scale`). The muP
+  point for an Adam-trained zero-init output layer: the coherent drift's
+  contribution to the logit is lr·Σ|a|·out_scale ≈ lr·d·rms·out_scale,
+  so 1/d makes it d-independent instead of the ~1000× overdrive that
+  killed the unscaled gate by step 500.
+- **`λ·Σ CE(emit)` at λ=1** replacing `λ·mean`, default λ 0.125→1. The
+  mean weighed each `<t>` target λ/k, and with P(k)∝k that cancelled the
+  fat tail exactly, pinning greedy halt at k_min for any γ — the
+  measured "halts at 4.0". The per-position sum makes the learned hazard
+  equal the training P(k); a9's call, one deviation from the literal ask
+  (λ=1 under the old mean would only have moved p(answer|dot4) from 0.91
+  to 0.57, still a halt at k_min).
+
+An OOM surfaced immediately: the fp32 [512, 262k] CE slabs held across a
+k=32 span are ~0.5 GB each × 33 = >16 GB. Fixed by checkpointing each CE
+chunk (recompute the head GEMM in backward); peak fell 16.45 → 12.46
+GiB, and the bf16 slabs it had also been keeping (~9 GB) are gone too.
+
+**Gate re-witness** (train gate, B=2 parity len4 k=3): loss 67.2547 =
+rerun vs reference 67.2768 (rel 3.3e-4; the loss now sums three
+emission positions), grads 3.64e-2 zero-init / 3.49e-2 perturbed (the
+perturbation std scales with d to match the calibration), span-drive vs
+HF 9.42e-2 / top-1 1.0000 inside the HF head's own rounding. 19 tests
+green on jobe.
+
+**Validation — a live gate, and the gate-lr knob.** Two 200-step
+timelines (snapshots every 10, `/tmp/sat2` and `/tmp/sat3` on jobe),
+probing α,β per dot position:
+
+- *1/d, full lr:* cross-instance std of α rises 0.0000 → 0.0035 — the
+  first time it has ever been nonzero (every prior run: exactly 0). The
+  median pre-sigmoid holds at the 2.2 init while |out.W| climbs to 23.5;
+  100% of dims stay unsaturated through step 140, a 0.4–2.6% tail by
+  step 200. Alive, engaging, with a slow-growing saturation tail (no
+  restoring force — weight decay 0).
+- *1/d, gate lr ×0.1:* |out.W| only 2.55 at step 200, 100% unsaturated
+  throughout, median pinned at 2.2 — pristine but input-dependence had
+  not engaged yet (std still 0.0000 at 200; at full lr it appeared once
+  |out.W| crossed ~8.6). Slower wall-clock, same eventual headroom.
+
+That contrast is the whole point of the second knob. a9's call: give the
+gate its own AdamW param group at a fraction of the row lr, exposed as
+`--gate-ratio` (a9 preferred the ratio over an absolute `--gate-lr`, so
+the schedule multiplier is explicit; default 0.1). The gate rides the
+row's warmup/cosine shape scaled by the ratio, floor included; each
+group carries its own (peak, floor) and the step loop drives them, so
+resume stays a pure function of the within-run step (peak/floor
+re-asserted from args after load_state_dict, since they are schedule
+config, not checkpoint state).
+
+**Why 1/d is the load-bearing one** (a9 asked whether it is necessary
+given gate-ratio; discussion, not a new measurement): Adam's step is
+scale-invariant, ≈lr·sign(grad) per entry regardless of gradient
+magnitude, so lowering the gate lr by r delays the sigmoid freeze by 1/r
+but slows W's per-step progress by r — the product, i.e. the
+input-dependent structure the gate can build before its gradient dies,
+is unchanged. 1/d instead pushes the freeze d× later while W keeps
+moving at ~lr, giving ~d× more achievable structure. So gate-ratio only
+paces wall-clock; the output scaling sets the ceiling. If one of the two
+were dropped, it should be gate-ratio, not the scaling. Left as
+argument — a9 declined the cheap falsification (unscaled × ratio sweep,
+predicted to keep std ~0 at every ratio).
+
+Nothing has been trained on a task under the corrected recipe yet;
+parity4 (a9 will launch) is the first test of whether a live gate
+changes the picture. The dead-gate parity results in findings are
+therefore all "row + constant mask", and were trimmed to a current-state
+summary there — their forensics (the α-mask tables, the
+bf16-untrainability ledger: `out.bias`/`norm.weight` frozen because half
+an ulp at magnitude ≥1 exceeds the Adam step, the non-decaying bf16
+second moment, and the one-ulp-wide readout with 40% ties) are recorded
+in the post-mortem entry above and here.
+

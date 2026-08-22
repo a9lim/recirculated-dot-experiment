@@ -137,7 +137,13 @@ training condition `dots+wire` denotes think scope, and its untrained
 null is `dots+think-wire`. Dot sweeps run max-k once and read every
 smaller k as a causal prefix — mathematically the same prefix, so the
 max-k shape is the canonical sweep definition; both trained arms use
-the identical live-row bf16 readout.
+the identical live-row readout. Every readout is fp32: label logits,
+the legality argmax, and gold_lp come from an fp32 head over the bf16
+hidden (`tasks.fp32_logits`, chunked over the vocabulary). At the
+trained head's logit scale (~20) a bf16 logit's ulp is 0.125 — wider
+than the forced-choice margins it decides; the bf16 readout produced
+eight distinct margins and 40% exact ties on a 512-instance sweep
+(journal 2026-08-22).
 
 **Free running (D14).** The forced k-sweep never measures D4/D12's
 actual claim — that the model chooses when to stop dotting — so a
@@ -175,8 +181,18 @@ with serial difficulty is itself wire evidence.
 synced into the model embedding for plain-forward arms) plus the
 paper's gate MLP (LN on concat(source, dest), two hidden GELU layers
 at d_model, sigmoid vector output; zero-init output layer with logit
-biases so training starts exactly at α=0.1, β=0.9). BF16 throughout;
-only Gemma's own RMSNorm fp32 reduction accumulator is wider. Base
+biases so training starts exactly at α=0.1, β=0.9; pre-sigmoid output
+`bias + (W·x)/d` — the 1/fan_in multiplier keeps AdamW's per-entry
+steps from drifting the logits by lr·Σ|x| per step; without it the
+coherent drift saturates the sigmoid to a constant 0/1 mask inside
+warmup (journal 2026-08-22). Precision split: the frozen base computes in bf16;
+the surface, its AdamW state, the gate's arithmetic, the loss, and
+every readout are fp32. bf16 parameters drop any AdamW update below
+half an ulp — a bias of magnitude 2 never moves at lr 1e-3 and
+nothing above ~0.1 moves at the 1e-4 floor — and a bf16 `sigmoid` is
+exactly 1 from z ≥ 6.25, which is a gate with zero gradient. The
+casts sit where the surface meets the residual stream: the scaled row
+entering the span, the mixed destination state leaving the gate. Base
 frozen — enforced: the loader freezes before any graph exists, and
 the first step raises if any base Parameter accumulates a gradient.
 The full-adapter rung is documented fallback only.
@@ -213,14 +229,34 @@ preservation off, so no prefix copy survives the forward.
 
 **Supervision (D12).** lm_head over the whole emission span: the last
 prompt position and every dot target `<t>`; the last dot targets the
-answer. Loss `CE(answer) + λ·mean(CE(emission))` (default λ=0.125, D15) — the
-task gradient is k-independent, the dot targets carry no task
-content (H2 stays clean), and with sampled k the emission term
+answer. Loss `CE(answer) + λ·Σ CE(emission)` (default λ=1, D15): every
+supervised position carries a k-independent weight, so the readout at
+the smallest training k — where a k_min batch's answer target and a
+longer batch's `<t>` target meet at the same position — learns
+P(answer | reached k_min) = P(k_min) / (P(k_min) + λ·Σ_{k>k_min} P(k)),
+and at λ=1 the learned halting hazard *is* the training k
+distribution (a per-position sum, not a mean over the span — the mean
+cancels the fat tail and pins halting at k_min; journal 2026-08-22).
+The dot targets carry
+no task content (H2 stays clean), and with sampled k the emission term
 teaches a stopping *hazard*, activating D4's halting-by-sampling in
 v0. Interior prompt positions stay unsupervised. Full-vocab CE via
-one-shape compiled 512-row slabs with a live tied `<t>` column.
+one-shape compiled 512-row slabs — bf16 GEMM, logits upcast, fp32
+log-softmax — with a live tied `<t>` column; each slab is
+checkpointed, so its [512, vocab] intermediates are recomputed in
+backward rather than held across the span.
 
-**Optimization (D6, D15).** AdamW, weight decay 0, peak lr 1e-3.
+**Optimization (D6, D15).** AdamW on the fp32 surface (master
+weights and moments; in bf16 the second moment cannot even decay —
+`v·0.999` rounds back to `v`), weight decay 0, peak lr 1e-3 for the
+row; the gate MLP trains in a second param group at `--gate-ratio`
+(default 0.1) times that, on the row's warmup/cosine shape with the
+floor scaled by the same ratio, so the two warm and decay together; the 1/d output
+scale slows AdamW's coherent logit drift but leaves no restoring
+force, and the smaller gate step keeps the pre-sigmoid in the live
+band over a long horizon (journal 2026-08-22). Each group carries its
+own (peak, floor) and the step loop drives them, so resume stays a
+pure function of the within-run step.
 `--cosine` is the total scheduled horizon (default 2000 steps), with
 linear warmup occupying its first `--warmup` fraction (default 0.05,
 so 100 steps) and cosine decay to `--lr-floor` (default 1e-4) over
@@ -289,8 +325,10 @@ alternatives, and the paths not taken are in the journal.
 
 - **D1** Wire = two-pass, paper-faithful; readout on first-pass
   logits; refresh from dest up; Eq. 1 norm-matched mix.
-- **D2** Trainable surface = `<t>` row + α,β gate MLP only; base
-  frozen; full adapter is fallback, not the experiment.
+- **D2** Trainable surface = `<t>` row + α,β gate MLP only (gate
+  output scaled 1/d); surface, optimizer state, gate math, loss and
+  readouts fp32 over the bf16 base; base frozen; full adapter is
+  fallback, not the experiment.
 - **D3** Task suite = discriminating 2×2 (S5, parity, reachability;
   3SUM control) + CoT topline; money plot accuracy vs k.
 - **D4** Halting is sampling: `<t>` is a real vocab token; the head
@@ -311,8 +349,8 @@ alternatives, and the paths not taken are in the journal.
 - **D11** Id-space serialization, single-token pins, forced-choice
   eval with legality and gold_lp; explicit scope labels.
 - **D12** Training v0: think-first, k sampled per batch,
-  emission-span supervision `CE(ans) + λ·mean(CE(emit))`, per-task
-  benchmark then mixture; online sampling; bf16 surface.
+  emission-span supervision `CE(ans) + λ·Σ CE(emit)`, per-task
+  benchmark then mixture; online sampling; fp32 surface.
 - **D13** Audited CUDA training: packed shared projections, regional
   compile, FA2-varlen dual branch, internal checkpoint-planner knees, max-k
   sweep eval, warm-everything + zero-compile-in-step, atomic
@@ -326,9 +364,11 @@ alternatives, and the paths not taken are in the journal.
   remainder, then a flat tail; stages reset by being separate runs.
   Training k is fat-tailed
   `P(k) ∝ k^γ` over `--train-k`, k≤2 eval-only (no readout sees the
-  wire before t=3); λ=0.125 (the emission term floors at hazard
-  entropy at any weight; small λ damps the homogeneous-k batches'
-  alternating dot/answer pressure on the tied row).
+  wire before t=3); λ=1 with per-position emission weights (a sum over
+  the span, not a mean), so the learned halting hazard equals the
+  training k distribution; the gate MLP trains in its own param group
+  at `--gate-ratio` (default 0.1) times --lr, a scaled copy of the
+  row's schedule.
 
 ## Open
 

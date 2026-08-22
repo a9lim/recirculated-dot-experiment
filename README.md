@@ -67,8 +67,10 @@ repo ([transformer-experiments](https://github.com/a9lim/transformer-experiments
 **Status**: wire and training path built and gate-verified; first
 learned signal at parity length 4 (wire-trained, wire-run beats the
 untrained forced-choice baseline; no length transfer yet — see
-findings); recipe D15 (cosine, fat-tailed k, λ=0.125) is the current
-training configuration.
+findings); recipe D15 (cosine, fat-tailed k, λ=1 per emission
+position) over an fp32 surface with a 1/d-scaled gate output (D2,
+2026-08-22 — every earlier run trained a saturated, constant gate) is
+the current training configuration.
 
 ## Running
 

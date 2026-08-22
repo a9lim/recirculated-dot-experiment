@@ -64,6 +64,10 @@ never re-implement.
   contract test for any bump.
 - bf16 gates are null-calibrated: when a tolerance is needed, measure
   the self-noise null first, don't guess.
+- bf16 is the frozen base's precision only. The trainable surface, its
+  optimizer state, the gate's arithmetic, the loss, and every readout
+  are fp32 (D2/D11): bf16 parameters silently drop AdamW updates and a
+  bf16 sigmoid saturates to exactly 1. Don't cast the surface down.
 
 ## Gates (the contract — run after touching model-facing code)
 

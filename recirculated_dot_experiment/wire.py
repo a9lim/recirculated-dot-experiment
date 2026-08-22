@@ -90,6 +90,8 @@ from torch.nn import functional as F
 from transformers import AttentionInterface, AttentionMaskInterface
 from transformers.models.gemma3.modeling_gemma3 import apply_rotary_pos_emb
 
+from .tasks import fp32_logits
+
 _PREFILL_BATCH = 64
 
 
@@ -490,12 +492,14 @@ class RecirculationEngine:
 
     def mix(self, h_s: Tensor, h_d: Tensor, alpha, beta) -> Tensor:
         # Eq. 1 (norm-matched mix). Semantic twin of train._mix — keep
-        # them in sync. Both inference constants and the adaptive gate's
-        # persistent tensors stay in the model's half precision.
-        ratio = h_d.norm(dim=-1, keepdim=True) / h_s.norm(
+        # them in sync. fp32 arithmetic, one cast back to the residual's
+        # dtype; the inference constants and the adaptive gate's outputs
+        # both arrive as fp32 (scalars or tensors).
+        h_s32, h_d32 = h_s.float(), h_d.float()
+        ratio = h_d32.norm(dim=-1, keepdim=True) / h_s32.norm(
             dim=-1, keepdim=True
         ).clamp_min(self.cfg.eps)
-        return beta * h_d + alpha * ratio * h_s
+        return (beta * h_d32 + alpha * ratio * h_s32).to(h_d.dtype)
 
     def _dual_attention(
         self, i: int, q: Tensor, k_new: Tensor, v_new: Tensor, scale: float
@@ -815,7 +819,7 @@ class RecirculationEngine:
                     ab = tuple(
                         q
                         if isinstance(q, Tensor)
-                        else torch.tensor(q, dtype=dtype, device=device)
+                        else torch.tensor(q, dtype=torch.float32, device=device)
                         for q in ab
                     )
                 x, h_s = self._step_c(
@@ -899,10 +903,15 @@ class RecirculationEngine:
         cache = self._run(input_ids, None)
         return cache.tops.index_select(1, positions)
 
+    def _answer_logits_fp32(self, h: Tensor) -> Tensor:
+        """fp32 head for answer-position readouts (D11); the per-token NLL
+        path keeps its fused bf16-logit graph."""
+        return fp32_logits(self.final_norm(h), self.lm_head.weight, self.softcap)
+
     @torch.inference_mode()
     def logits_from_hidden(self, hidden: Tensor) -> Tensor:
-        """BF16 head for a raw top state returned by a sweep."""
-        return self._logits_chunk(hidden.unsqueeze(1)).squeeze(1)
+        """fp32 head for a raw top state returned by a sweep."""
+        return self._answer_logits_fp32(hidden)
 
     @torch.inference_mode()
     def answer_logits(self, input_ids: Tensor, alpha_fn=None) -> Tensor:
@@ -911,8 +920,8 @@ class RecirculationEngine:
         The task readout (design.md D3/D4): the last think token predicts
         the answer, so forced-choice scoring needs exactly one position —
         no per-dot NLL is ever computed, mirroring D9's answer-only
-        supervision. Same tops and BF16 head as teacher_forced_logits' last
-        column, at chunk width 1."""
+        supervision. Same tops as teacher_forced_logits' last column, read
+        through the fp32 head."""
         T = input_ids.shape[1]
         cache = self._run(input_ids, alpha_fn)
-        return self._logits_chunk(cache.tops[:, T - 1 : T]).squeeze(1)
+        return self._answer_logits_fp32(cache.tops[:, T - 1])

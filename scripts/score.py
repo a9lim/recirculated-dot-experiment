@@ -29,6 +29,7 @@ torch._dynamo.config.recompile_limit = 256
 
 from recirculated_dot_experiment import tasks
 from recirculated_dot_experiment.train import (
+    CHECKPOINT_VERSION,
     DotsAdapter,
     PromptStateCache,
     Surface,
@@ -78,6 +79,12 @@ def main() -> None:
 
     def load_surface(path):
         state = torch.load(path, map_location="cuda", weights_only=False)
+        if state.get("version") != CHECKPOINT_VERSION:
+            raise ValueError(
+                f"{path}: checkpoint version {state.get('version')}, scorer wants "
+                f"{CHECKPOINT_VERSION} (pre-precision-boundary surfaces are bf16 "
+                "with an unscaled gate output; score them at their own commit)"
+            )
         surface = Surface(model, dot_id).cuda()
         surface.load_state_dict(state["surface"], strict=True)
         return surface, state

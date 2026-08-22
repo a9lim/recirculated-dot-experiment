@@ -187,7 +187,8 @@ def evaluate(
             for i in range(0, len(rows), batch):
                 group = rows[i : i + batch]
                 ids = torch.tensor([e.ids for e in group], device=device)
-                _score(model(ids, logits_to_keep=1).logits[:, -1], group, sums)
+                hidden = model.model(input_ids=ids, use_cache=False).last_hidden_state
+                _score(_position_logits(model, None, hidden[:, -1]), group, sums)
     n = sums.pop("n")
     return {key: value / n for key, value in sums.items()} | {"n": n}
 
@@ -206,15 +207,32 @@ def _sweep_hiddens(model, runner, ids: torch.Tensor, ks: list[int], start: int):
     return hidden.index_select(1, positions)
 
 
+def fp32_logits(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    softcap: float | None = None,
+    chunk: int = 32768,
+) -> torch.Tensor:
+    """Full-vocab logits in fp32 from a half-precision head (D11: every
+    readout is fp32 — at the trained head's logit scale (~20) a bf16
+    logit has an ulp of 0.125, wider than the forced-choice margins it
+    decides). Chunked over the vocabulary so the fp32 weight never
+    materializes whole."""
+    h = hidden.float()
+    out = torch.empty(*h.shape[:-1], weight.shape[0], dtype=torch.float32, device=h.device)
+    for lo in range(0, weight.shape[0], chunk):
+        out[..., lo : lo + chunk] = h @ weight[lo : lo + chunk].float().T
+    if softcap is not None:
+        out = torch.tanh(out / softcap) * softcap
+    return out
+
+
 def _position_logits(model, runner, hidden: torch.Tensor) -> torch.Tensor:
-    """Full-vocab logits for one selected position's hiddens."""
+    """Full-vocab fp32 logits for one selected position's hiddens."""
     if runner is not None:
         return runner.logits_from_hidden(hidden)
-    logits = model.lm_head(hidden)
     softcap = getattr(model.config, "final_logit_softcapping", None)
-    if softcap is not None:
-        logits = torch.tanh(logits / softcap) * softcap
-    return logits
+    return fp32_logits(hidden, model.lm_head.weight, softcap)
 
 
 @torch.inference_mode()

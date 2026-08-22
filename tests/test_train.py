@@ -32,13 +32,15 @@ def test_execution_plan_keeps_effective_batch_and_compiled_shapes():
 
 def test_tensor_gate_mix_matches_module_path_and_gradients():
     torch.manual_seed(17)
-    gate = GateMLP(8).to(dtype=torch.bfloat16)
+    gate = GateMLP(8)
     with torch.no_grad():
-        gate.out.weight.normal_(std=1e-3)
+        gate.out.weight.normal_(std=1e-3 / gate.out_scale)
     source = torch.randn(3, 1, 8, dtype=torch.bfloat16, requires_grad=True)
     dest = torch.randn(3, 1, 8, dtype=torch.bfloat16, requires_grad=True)
     alpha, beta = gate(source, dest)
+    assert alpha.dtype == beta.dtype == torch.float32
     expected = _mix(1e-6, source, dest, alpha, beta)
+    assert expected.dtype == torch.bfloat16
     actual = _gate_mix_math(
         1e-6,
         source,
@@ -51,6 +53,7 @@ def test_tensor_gate_mix_matches_module_path_and_gradients():
         gate.h2.bias,
         gate.out.weight,
         gate.out.bias,
+        gate.out_scale,
     )
     assert torch.equal(expected, actual)
 
@@ -134,14 +137,65 @@ def test_lr_schedule_is_pure_and_run_length_independent():
     assert _lr_at(50, flat) == pytest.approx(1e-3)
 
 
-def test_surface_has_only_bf16_parameters():
+def test_lr_schedule_scales_a_group_by_its_own_peak_and_floor():
+    base = {"lr": 1e-3, "warmup": 0.05, "cosine": 2000, "lr_floor": 1e-4}
+    args = SimpleNamespace(**base, steps=2000)
+    gate_peak, gate_floor = 1e-4, 1e-5  # gate_lr/lr = 0.1, floor scaled likewise
+    # warmup and cosine keep the 10x ratio at every step
+    for step in (0, 50, 100, 1050, 2000, 9000):
+        assert _lr_at(step, args, gate_peak, gate_floor) == pytest.approx(
+            0.1 * _lr_at(step, args)
+        )
+    # cosine 0 is flat at the group's own peak
+    flat = SimpleNamespace(**{**base, "cosine": 0}, steps=2000)
+    assert _lr_at(500, flat, gate_peak, gate_floor) == pytest.approx(gate_peak)
+
+
+def test_gate_starts_at_paper_constants_and_scales_output_by_fan_in():
+    torch.manual_seed(3)
+    d = 8
+    gate = GateMLP(d)
+    assert gate.out_scale == 1.0 / d
+    source = torch.randn(5, 1, d, dtype=torch.bfloat16)
+    dest = torch.randn(5, 1, d, dtype=torch.bfloat16)
+    alpha, beta = gate(source, dest)
+    # zero-init output: exactly the paper constants, input-independent
+    assert torch.allclose(alpha, torch.full_like(alpha, 0.1), atol=1e-6)
+    assert torch.allclose(beta, torch.full_like(beta, 0.9), atol=1e-6)
+    with torch.no_grad():
+        gate.out.weight.normal_()
+    alpha, beta = gate(source, dest)
+    x = torch.cat((source, dest), dim=-1).float()
+    x = torch.nn.functional.gelu(gate.h1(gate.norm(x)))
+    x = torch.nn.functional.gelu(gate.h2(x))
+    z = x @ gate.out.weight.T / d + gate.out.bias
+    want_alpha, want_beta = torch.sigmoid(z).chunk(2, dim=-1)
+    assert torch.allclose(alpha, want_alpha, atol=1e-6)
+    assert torch.allclose(beta, want_beta, atol=1e-6)
+
+
+def test_mix_computes_in_fp32_and_returns_the_residual_dtype():
+    torch.manual_seed(5)
+    source = torch.randn(4, 1, 8, dtype=torch.bfloat16)
+    dest = torch.randn(4, 1, 8, dtype=torch.bfloat16)
+    alpha = torch.rand(4, 1, 8)
+    beta = torch.rand(4, 1, 8)
+    mixed = _mix(1e-6, source, dest, alpha, beta)
+    assert mixed.dtype == torch.bfloat16
+    s, d = source.float(), dest.float()
+    ratio = d.norm(dim=-1, keepdim=True) / s.norm(dim=-1, keepdim=True)
+    assert torch.equal(mixed, (beta * d + alpha * ratio * s).to(torch.bfloat16))
+
+
+def test_surface_holds_fp32_parameters_over_a_bf16_base():
     embedding = nn.Embedding(128, 16, dtype=torch.bfloat16)
     model = SimpleNamespace(
         config=SimpleNamespace(hidden_size=16),
         model=SimpleNamespace(embed_tokens=embedding),
     )
     surface = Surface(model, 7)
-    assert {parameter.dtype for parameter in surface.parameters()} == {torch.bfloat16}
+    assert {parameter.dtype for parameter in surface.parameters()} == {torch.float32}
+    assert torch.equal(surface.row, embedding.weight[7].float())
 
 
 def test_surface_rejects_non_bf16_base():
