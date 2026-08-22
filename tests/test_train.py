@@ -118,20 +118,20 @@ def test_step_schedule_weights_tilt_and_exclude():
 
 
 def test_lr_schedule_is_pure_and_run_length_independent():
-    base = {"lr": 1e-3, "warmup": 100, "cosine": 2000, "lr_floor": 1e-4}
+    base = {"lr": 1e-3, "warmup": 0.05, "cosine": 2000, "lr_floor": 1e-4}
     args = SimpleNamespace(**base, steps=2000)
     assert _lr_at(0, args) == 0.0
     assert _lr_at(50, args) == pytest.approx(5e-4)
     assert _lr_at(100, args) == pytest.approx(1e-3)  # cosine starts at the peak
-    assert _lr_at(1100, args) == pytest.approx((1e-3 + 1e-4) / 2)  # midpoint
-    assert _lr_at(2100, args) == pytest.approx(1e-4)  # period ends at the floor
-    assert _lr_at(9000, args) == pytest.approx(1e-4)  # flat tail past the period
+    assert _lr_at(1050, args) == pytest.approx((1e-3 + 1e-4) / 2)  # midpoint
+    assert _lr_at(2000, args) == pytest.approx(1e-4)  # horizon ends at the floor
+    assert _lr_at(9000, args) == pytest.approx(1e-4)  # flat tail past the horizon
     # the schedule never reads the run length
     longer = SimpleNamespace(**base, steps=5000)
     assert all(_lr_at(s, args) == _lr_at(s, longer) for s in range(0, 5001, 97))
     flat = SimpleNamespace(**{**base, "cosine": 0}, steps=2000)
     assert _lr_at(1100, flat) == pytest.approx(1e-3)
-    assert _lr_at(50, flat) == pytest.approx(5e-4)
+    assert _lr_at(50, flat) == pytest.approx(1e-3)
 
 
 def test_surface_has_only_bf16_parameters():

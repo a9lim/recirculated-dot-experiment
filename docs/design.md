@@ -220,16 +220,18 @@ teaches a stopping *hazard*, activating D4's halting-by-sampling in
 v0. Interior prompt positions stay unsupervised. Full-vocab CE via
 one-shape compiled 512-row slabs with a live tied `<t>` column.
 
-**Optimization (D6, D15).** AdamW, weight decay 0, peak lr 1e-3:
-linear warmup (default 100 steps), one cosine period down to
-`--lr-floor` (default 1e-4), then flat at the floor. The period
-(`--cosine`, default 2000 steps; 0 = flat at peak) is deliberately
-independent of `--steps` — a run may end mid-cosine or coast on the
-floor — and the lr is a pure function of the within-run step, so
-resume is exact with no schedule state. The prior experiment's
-hard-won lesson stands as *stage* discipline: a single schedule must
-never span a curriculum stage transition; each stage is its own run
-with its own warmup+cosine. Checkpoints are atomic and
+**Optimization (D6, D15).** AdamW, weight decay 0, peak lr 1e-3.
+`--cosine` is the total scheduled horizon (default 2000 steps), with
+linear warmup occupying its first `--warmup` fraction (default 0.05,
+so 100 steps) and cosine decay to `--lr-floor` (default 1e-4) over
+the remainder; later steps stay flat at the floor. The horizon is
+deliberately independent of `--steps` — a run may end mid-schedule or
+coast on the floor — and `--cosine 0` is flat at peak from the first
+step, with no warmup. The lr is a pure function of the within-run
+step, so resume is exact with no schedule state. The prior
+experiment's hard-won lesson stands as *stage* discipline: a single
+schedule must never span a curriculum stage transition; each stage
+is its own run with its own warmup+cosine. Checkpoints are atomic and
 RNG/optimizer-complete, resumable by step (`--resume`), default
 `data/train/surface.pt`.
 
@@ -319,9 +321,10 @@ alternatives, and the paths not taken are in the journal.
   (content-free dots make the rollout prefix deterministic): greedy
   halt plus the closed-form sampled-halting marginal; non-halt within
   budget is a recorded outcome; dot arms only, CoT stays forced.
-- **D15** Within-stage LR is cosine to a floor with a period
-  independent of the run length (flat tail past the period; stages
-  reset by being separate runs); training k is fat-tailed
+- **D15** Within-stage LR has a run-length-independent horizon:
+  fractional linear warmup inside it, cosine to a floor over the
+  remainder, then a flat tail; stages reset by being separate runs.
+  Training k is fat-tailed
   `P(k) ∝ k^γ` over `--train-k`, k≤2 eval-only (no readout sees the
   wire before t=3); λ=0.125 (the emission term floors at hazard
   entropy at any weight; small λ damps the homogeneous-k batches'

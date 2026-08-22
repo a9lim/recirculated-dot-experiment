@@ -1230,16 +1230,19 @@ def evaluate_sweep(
 def _lr_at(step: int, args) -> float:
     """Learning rate as a pure function of the within-run step (D15).
 
-    Linear warmup to the peak, one cosine period down to the floor, then
-    flat at the floor. The period is independent of --steps: a run may
-    end mid-cosine or coast on the floor, and curriculum stages reset
-    schedules by being separate runs (D6). --cosine 0 is the flat recipe.
+    ``--cosine`` is the total scheduled horizon: its first ``--warmup``
+    fraction rises linearly to the peak, its remainder decays to the floor,
+    and later steps stay at the floor. The horizon is independent of
+    ``--steps``, and curriculum stages reset schedules by being separate
+    runs (D6). ``--cosine 0`` is flat at the peak from the first step.
     """
-    if step < args.warmup:
-        return args.lr * step / max(args.warmup, 1)
     if not args.cosine:
         return args.lr
-    t = min((step - args.warmup) / args.cosine, 1.0)
+    warmup_steps = int(args.warmup * args.cosine)
+    if step < warmup_steps:
+        return args.lr * step / max(warmup_steps, 1)
+    decay_steps = args.cosine - warmup_steps
+    t = min((step - warmup_steps) / decay_steps, 1.0)
     return args.lr_floor + (args.lr - args.lr_floor) * 0.5 * (1 + math.cos(math.pi * t))
 
 
@@ -1440,7 +1443,8 @@ def run_mode(args) -> None:
     print(
         f"condition {args.condition}, tasks {task_list}, eval k {k_set}, "
         f"train k {train_k} (P~k^{args.k_gamma:g}), B {args.batch}, "
-        f"lr {args.lr:g} cosine {args.cosine} floor {args.lr_floor:g}"
+        f"lr {args.lr:g} cosine {args.cosine} warmup {args.warmup:g} "
+        f"({int(args.warmup * args.cosine)} steps) floor {args.lr_floor:g}"
     )
 
     producer = _BatchProducer(tok, args, task_list, train_k, start_step, k_weights)
@@ -1628,8 +1632,9 @@ def main() -> None:
         "--cosine",
         type=int,
         default=2000,
-        help="cosine period in steps after warmup, then flat at the floor; "
-        "independent of --steps; 0 = flat at --lr (D15)",
+        help="total scheduled horizon in steps, including warmup, then flat "
+        "at the floor; independent of --steps; 0 = flat at --lr from the "
+        "first step (D15)",
     )
     p.add_argument("--lr-floor", type=float, default=1e-4)
     p.add_argument(
@@ -1640,7 +1645,13 @@ def main() -> None:
         "weight, and a small one damps the per-batch dot/answer pressure on "
         "the tied row",
     )
-    p.add_argument("--warmup", type=int, default=100)
+    p.add_argument(
+        "--warmup",
+        type=float,
+        default=0.05,
+        metavar="RATIO",
+        help="linear-warmup fraction of --cosine (default 0.05)",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--eval-every", type=int, default=500)
@@ -1666,6 +1677,10 @@ def main() -> None:
         help="resume from PATH, or from --out when passed without PATH",
     )
     args = p.parse_args()
+    if args.cosine < 0:
+        p.error("--cosine must be nonnegative")
+    if not 0 <= args.warmup < 1:
+        p.error("--warmup must be a ratio in [0, 1)")
     if args.knobs:
         # CLI-scope override of the pinned task knobs (like the recompile
         # guard above): batches and eval rows in this process see one

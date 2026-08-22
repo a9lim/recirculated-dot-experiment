@@ -442,3 +442,15 @@ the measured D13 automatic policy, so every warmup and training step uses the
 same B*k/microbatch/layer knees. The checkpoint *saving* flags are unchanged;
 this is only activation recomputation. Operator and current-state docs now
 describe the planner as internal.
+
+## 2026-08-22 — warmup moves inside the schedule horizon
+
+The absolute `--warmup 100` made `--cosine N` reach the floor at
+step `N+100`, a hidden extension that also made run-tail arithmetic easy to
+misstate. a9 and the seat agreed on one proportional schedule: `--warmup` is
+now a ratio (default 0.05) inside the total `--cosine` horizon. For the default
+2000-step horizon that is 100 warmup steps, 1900 cosine-decay steps, and the
+floor is reached at step 2000; a 3000-step run therefore has a 1000-step flat
+tail. `--cosine 0` is flat at peak from the first step and implies zero warmup.
+This changes the schedule encoded by pre-change checkpoints, so runs do not
+resume across this boundary.

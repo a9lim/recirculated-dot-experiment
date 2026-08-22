@@ -88,10 +88,12 @@
 #                            and stops at N.
 #   --lr X                   AdamW peak learning rate (default 1e-3; weight decay
 #                            is always zero).
-#   --warmup N               Linear-warmup steps to --lr (default 100).
-#   --cosine N               Cosine period after warmup (default 2000), independent
-#                            of --steps; after N steps it stays at --lr-floor.
-#                            0 disables cosine and holds --lr after warmup.
+#   --warmup R               Linear-warmup fraction of the --cosine horizon
+#                            (default 0.05); the step count is floor(R*cosine).
+#   --cosine N               Total scheduled horizon including warmup (default
+#                            2000), independent of --steps; after step N it stays
+#                            at --lr-floor. 0 holds --lr from the first step and
+#                            implies no warmup.
 #   --lr-floor X             Post-cosine learning-rate floor (default 1e-4;
 #                            unused when --cosine 0).
 #   --lam X                  Weight of mean emission-span CE in
